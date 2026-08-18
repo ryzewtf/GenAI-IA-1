@@ -1,0 +1,308 @@
+# Model panel. Values marked `# VERIFIED §1.4` were read from the model's own config.json or
+# modeling code during planning. Fields set to `null` are filled by a specific task and MUST NOT
+# be guessed — the task ID that populates each is named in the comment.
+#
+#   T1.1 -> gguf.*, revision, checkpoint_status
+#   T1.2 -> router_dtype
+#   T1.3 -> confirms every VERIFIED field against the live config.json
+#   T1.4 -> node_names.*, logit_tensor_used
+#
+# node_names / logit_tensor_used (T1.4). Read from llama.cpp master build_moe_ffn, the routing chain
+# is:  ffn_moe_logits -> [ffn_moe_logits_biased] -> ffn_moe_probs -> [ffn_moe_probs_biased] ->
+#      [ffn_moe_probs_masked] -> ggml_argsort_top_k -> ffn_moe_topk
+# `logit_tensor_used` must name the LAST node present, because that is the tensor top-k actually
+# consumed and therefore the only one whose k vs k+1 margin explains a flip (§1.6, T8.2). Softmax
+# and sigmoid are monotonic so they do not change the ORDER, but ffn_moe_probs_biased and
+# ffn_moe_probs_masked do. Templates carry one "%d" for the model layer index; generate the harness
+# spec with `python -m src.capture.nodespec --model <key>`.
+#
+# Config-key gotcha (T1.3): key names are NOT uniform across the panel. Use `config_keys` below,
+# never a single generic assertion loop — that KeyErrors on DeepSeek and Gemma.
+
+schema_version: 1
+
+defaults:
+  quant: Q4_K_M
+  # llama.cpp never quantizes ffn_gate_inp.weight — explicit NAME rule in src/llama-quant.cpp,
+  # not a shape rule. "Not quantized" == inherits the SOURCE dtype, which is why T1.2 exists.
+  router_quantized: false
+
+models:
+
+  olmoe-0125:
+    hf_repo: allenai/OLMoE-1B-7B-0125
+    revision: null                      # T1.1
+    checkpoint_status: base
+    role: [pair_g, pair_a, primary, pipeline_validator, scale_run, precision_ladder]
+    n_experts: 64                       # VERIFIED §1.4
+    top_k: 8                            # VERIFIED §1.4
+    n_moe_layers: 16                    # VERIFIED §1.4
+    moe_layer_offset: 0                 # all layers are MoE
+    hidden_dim: 2048                    # VERIFIED §1.4
+    post_topk: none                     # norm_topk_prob: false
+    aux_loss: {key: router_aux_loss_coef, value: 0.01}
+    shared_experts: 0
+    vocab_size: 50304
+    moe_intermediate_size: 1024          # VERIFIED T1.3 — "high granularity": 64 small experts
+    max_position_embeddings: 4096        # VERIFIED T1.3
+    first_k_dense_replace: 0             # every layer is MoE; the layer map is the identity
+    moe_layer_freq: 1
+    has_router_bias: false               # VERIFIED T1.3 — no gate_inp_b
+    has_expert_selection_bias: false     # VERIFIED T1.3 — no e_score_correction_bias
+    n_expert_groups: 1                   # VERIFIED T1.3 — no group routing
+    multimodal: false
+    router_module_path: model.layers.{i}.mlp.gate
+    approx_size_gb: 4.2
+    device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
+    config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}   # T1.1
+    router_dtype: null                  # T1.2
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}  # T1.4
+    logit_tensor_used: null             # T1.4
+
+  olmoe-0125-instruct:
+    hf_repo: allenai/OLMoE-1B-7B-0125-Instruct
+    revision: null
+    checkpoint_status: instruct
+    role: [pair_g_posttraining_control]   # §1.5 — converts a Pair G confound into a measurement
+    # Architecture identical to olmoe-0125; T1.3 must confirm rather than assume.
+    n_experts: 64
+    top_k: 8
+    n_moe_layers: 16
+    moe_layer_offset: 0
+    hidden_dim: 2048
+    post_topk: none
+    aux_loss: {key: router_aux_loss_coef, value: 0.01}
+    shared_experts: 0
+    vocab_size: 50304
+    moe_intermediate_size: 1024          # VERIFIED T1.3 — "high granularity": 64 small experts
+    max_position_embeddings: 4096        # VERIFIED T1.3
+    first_k_dense_replace: 0             # every layer is MoE; the layer map is the identity
+    moe_layer_freq: 1
+    has_router_bias: false               # VERIFIED T1.3 — no gate_inp_b
+    has_expert_selection_bias: false     # VERIFIED T1.3 — no e_score_correction_bias
+    n_expert_groups: 1                   # VERIFIED T1.3 — no group routing
+    multimodal: false
+    router_module_path: model.layers.{i}.mlp.gate
+    approx_size_gb: 4.2
+    device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
+    config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
+    # FIRST DOWNLOAD of the panel and the T1.4 vehicle: smallest checkpoint (7B total / 1B active),
+    # and the only OLMoE variant with a first-party GGUF — the 0125 and 0924 *base* repos publish
+    # none. It is a real panel entry, not a stand-in, so verifying node names here covers arch
+    # `olmoe`, which is 3 of the 7 checkpoints. sha256/size_bytes stay null until T1.1 verifies them
+    # against the downloaded bytes; recording a hash we have not computed would defeat the check.
+    # VERIFIED T1.1 — computed from the downloaded bytes on 2026-08-17, not copied from the Hub.
+    gguf: {repo: allenai/OLMoE-1B-7B-0125-Instruct-GGUF,
+           file: OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf,
+           sha256: 4ddc0e53159ed512b8dd67914a66e27bc618f694672ba43a9a0454eabd9c684f,
+           size_bytes: 4213512192}
+    # VERIFIED T1.2 — GATE PASSED. `python -m src.capture.router_audit` found 16 ffn_gate_inp
+    # tensors, all F32, in a checkpoint whose experts are Q4_K. The count independently confirms
+    # n_moe_layers: 16 with first_k_dense_replace: 0 from the artifact rather than from config.json.
+    router_dtype: F32
+    # VERIFIED T1.4 — GATE PASSED, from a real `llama-eval-callback -ngl 0 -c 512` dump
+    # (results/nodescan_olmoe.log). Exactly one logits / topk / router-input node in each of the
+    # 16 MoE layers, il 0..15, shapes and dtype checked (topk ne[0]=8 i32, probs ne[0]=64,
+    # ffn_norm ne[0]=2048).
+    # The selection chain present is `ffn_moe_logits -> ffn_moe_probs` and nothing after it, so
+    # top-k consumed **ffn_moe_probs**, not the raw logits — that is what `logit_tensor_used`
+    # records and what the margins stream must hold (I13). Softmax is monotonic so the *order*
+    # is the same either way; the *margins* are not, and the margins are the measurement.
+    # `ffn_norm` was resolved structurally, from the source list of ffn_moe_logits, not by name.
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null,
+                 topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
+    logit_tensor_used: ffn_moe_probs
+    drop_order: 2                        # Gate Q1 drop order
+
+  olmoe-0924:
+    hf_repo: allenai/OLMoE-1B-7B-0924
+    revision: null
+    checkpoint_status: base
+    # Pair A: 0125 is 0924 annealed for a further 100B tokens; config.json files are IDENTICAL.
+    # The ONLY pair in the panel where F1 conditions on an identical variable (same tokenizer),
+    # so it carries the tokenizer-controlled version of the token-ID claim (§1.5, T7.3).
+    role: [pair_a]
+    n_experts: 64
+    top_k: 8
+    n_moe_layers: 16
+    moe_layer_offset: 0
+    hidden_dim: 2048
+    post_topk: none
+    aux_loss: {key: router_aux_loss_coef, value: 0.01}
+    shared_experts: 0
+    vocab_size: 50304
+    moe_intermediate_size: 1024          # VERIFIED T1.3 — "high granularity": 64 small experts
+    max_position_embeddings: 4096        # VERIFIED T1.3
+    first_k_dense_replace: 0             # every layer is MoE; the layer map is the identity
+    moe_layer_freq: 1
+    has_router_bias: false               # VERIFIED T1.3 — no gate_inp_b
+    has_expert_selection_bias: false     # VERIFIED T1.3 — no e_score_correction_bias
+    n_expert_groups: 1                   # VERIFIED T1.3 — no group routing
+    multimodal: false
+    router_module_path: model.layers.{i}.mlp.gate
+    approx_size_gb: 4.2
+    device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
+    config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
+    router_dtype: null
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    logit_tensor_used: null
+    drop_order: 1                        # first cut if quota binds
+
+  gpt-oss-20b:
+    hf_repo: openai/gpt-oss-20b
+    revision: null
+    checkpoint_status: instruct          # OpenAI released no base checkpoint
+    role: [pair_g, primary]
+    n_experts: 32                        # VERIFIED §1.4
+    top_k: 4                             # VERIFIED §1.4
+    n_moe_layers: 24                     # VERIFIED §1.4
+    moe_layer_offset: 0
+    hidden_dim: 2880                     # VERIFIED §1.4
+    post_topk: softmax_over_selected
+    aux_loss: {key: router_aux_loss_coef, value: 0.9}   # 900x the rest of the panel — T9.4 confound
+    shared_experts: 0
+    vocab_size: 201088
+    approx_size_gb: 12
+    quant: MXFP4                         # PANEL EXCEPTION: native, do NOT requantize
+    # THE critical model for §1.6. GPT-OSS supplies gate_inp_b, so selection runs on
+    # ffn_moe_logits_biased. Recomputing top-k from the unbiased tensor yields sets the model
+    # never routed, in half of the headline pair. T1.4's bias sanity check is the positive test.
+    has_router_bias: true                # VERIFIED §1.6
+    device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
+    config_keys: {experts: num_local_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
+    router_dtype: null
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    logit_tensor_used: null
+    notes: >
+      transformers MXFP4 gates at compute capability >= (7,5); a T4 is exactly (7,5), so the
+      T3.2 cross-validation is an open empirical question, not a known blocker. Needs Triton
+      >= 3.4 and the `kernels` package (checked in T0.1); without them it dequantizes to bf16
+      (~40 GB) and fails.
+
+  deepseek-v2-lite:
+    hf_repo: deepseek-ai/DeepSeek-V2-Lite
+    revision: null
+    checkpoint_status: base
+    role: [primary, shared_expert_panel, precision_spot_check]
+    n_experts: 64                        # VERIFIED §1.4 — routed only; normalizer is 64
+    top_k: 6                             # VERIFIED §1.4
+    # first_k_dense_replace: 1 -> layer 0 is a DENSE FFN. 26 MoE layers, not 27.
+    # Model layers 1..26 map to trace layers 0..25. An off-by-one corrupts every per-depth result.
+    n_moe_layers: 26                     # VERIFIED §1.4
+    moe_layer_offset: 1                  # VERIFIED §1.4 — trace layer i == model layer i+1
+    first_k_dense_replace: 1
+    moe_layer_freq: 1                    # every layer from 1 on is MoE, so the map is contiguous
+    # V2-Lite uses plain greedy top-k: no e_score_correction_bias (that is V3) and n_group=1, so
+    # selection runs on `ffn_moe_probs` with no bias node and no group mask. Both matter because
+    # either one would make the selection order differ from the raw logit order (see nodespec.py).
+    has_expert_selection_bias: false     # VERIFIED — exp_probs_b is DeepSeek-V3 only
+    n_expert_groups: 1                   # VERIFIED — n_group=1, topk_group=1
+    hidden_dim: 2048                     # VERIFIED §1.4
+    post_topk: none
+    aux_loss: {key: aux_loss_alpha, value: 0.001}       # NOT router_aux_loss_coef
+    shared_experts: 2                    # always active -> deterministic -> EXCLUDED from entropy
+    approx_size_gb: 10.4
+    device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
+    config_keys: {experts: n_routed_experts, top_k: num_experts_per_tok, aux_loss: aux_loss_alpha, nesting: null}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
+    router_dtype: null
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    logit_tensor_used: null
+
+  qwen3-30b-a3b:
+    hf_repo: Qwen/Qwen3-30B-A3B
+    revision: null
+    checkpoint_status: null              # T1.1 / O5 — default `-it`
+    role: [pair_t, primary]
+    n_experts: 128                       # VERIFIED §1.4
+    top_k: 8                             # VERIFIED §1.4
+    n_moe_layers: 48                     # VERIFIED §1.4
+    moe_layer_offset: 0
+    hidden_dim: 2048                     # VERIFIED §1.4
+    post_topk: normalized                # norm_topk_prob: true
+    aux_loss: {key: router_aux_loss_coef, value: 0.001}
+    shared_experts: 0
+    vocab_size: 151936
+    approx_size_gb: 18.6
+    device_plan: {n_gpu: 2, split_mode: layer, tensor_split: [0.5, 0.5]}   # pinned; see T8.5
+    config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
+    router_dtype: null
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    logit_tensor_used: null
+    notes: >
+      Largest logit trace in the panel: 128 experts x 48 layers x 2 B = 12 KB/token -> ~12 GB at
+      1M tokens. This alone justifies the chunked memmap reader (T6.1) regardless of RAM.
+
+  gemma-4-26b-a4b:
+    hf_repo: google/gemma-4-26B-A4B
+    # O6 CLOSED: the repo resolves. Released 2026-04-03 under Apache-2.0; 25.2B total / 3.8B active,
+    # 30 layers, 128 routed experts, 8 active, vocab 262K, 256K context, sliding window 1024.
+    # Pair T does not need a substitute.
+    availability: verified
+    release_date: 2026-04-03
+    license: apache-2.0
+    sliding_window: 1024                 # attention only; irrelevant to routing capture at -c 2048
+    revision: null
+    checkpoint_status: null              # T1.1 / O5 — default `-it` (no base GGUF is published)
+    role: [pair_t, primary, shared_expert_panel]
+    n_experts: 128                       # VERIFIED §1.4
+    top_k: 8                             # VERIFIED §1.4
+    n_moe_layers: 30                     # VERIFIED §1.4
+    moe_layer_offset: 0
+    hidden_dim: 2816                     # VERIFIED §1.4 (not 2048)
+    moe_intermediate_size: 704
+    post_topk: normalized+per_expert_scale   # O1 CLOSED — see §1.4 / T1.3
+    aux_loss: {key: null, value: null}   # absent from config
+    # CORRECTED (T1.3): planning recorded shared_experts: 0 plus a parallel dense MLP. The published
+    # architecture is "8 active / 128 total AND 1 shared" — an always-on expert, however llama.cpp
+    # chooses to implement it. Either reading gives the same always-on capacity, so the consequences
+    # below stand, but the count was wrong and 0 would have been used as a normalizer.
+    #
+    # Consequences, all of which already applied under the old reading:
+    #   * the shared expert is deterministic, carries NO routing information, and is EXCLUDED from
+    #     every entropy and MI quantity (same rule as DeepSeek's 2)
+    #   * 128 is the routed count and therefore the normalizer; top_k 8 is over the routed experts
+    #   * Pair T is not architecture-matched, and Gemma groups with DeepSeek wherever always-on
+    #     capacity is discussed (§1.5, T9.3)
+    shared_experts: 1                    # VERIFIED T1.3 — was 0; see above
+    parallel_dense_mlp: true             # VERIFIED §1.4 — may be the same always-on branch as above
+    shared_expert_implementation: unresolved   # T1.4 settles which of the two it is in llama.cpp
+    # Router lives at model.language_model.layers[i].router — NOT .mlp (.mlp is the dense branch).
+    # A hook on .mlp captures the wrong tensor.
+    router_module_path: model.language_model.layers.{i}.router
+    vocab_size: 262144
+    max_position_embeddings: 262144      # ⇒ -c 2048 is MANDATORY or the KV cache OOMs a T4 (I4)
+    multimodal: true                     # download the TEXT gguf only; skip mmproj-*
+    approx_size_gb: 15.5
+    device_plan: {n_gpu: 2, split_mode: layer, tensor_split: [0.5, 0.5]}
+    config_keys: {experts: num_experts, top_k: top_k_experts, aux_loss: null, nesting: text_config}
+    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
+    router_dtype: null
+    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    logit_tensor_used: null
+
+# --- comparison structure (§1.5) ---------------------------------------------------------------
+# None of these is a strictly controlled pair except Pair A. The framing matters in the write-up.
+pairs:
+  pair_g:
+    members: [gpt-oss-20b, olmoe-0125]
+    holds_fixed: [activated_density_12.5pct]
+    not_matched: [post_training, quant_format, depth, attention, aux_loss_coef, expert_ffn_width,
+                  vocabulary, pytorch_xval_coverage]
+    framing: "matched density, with these differences documented"
+    controls: [olmoe-0125-instruct]
+  pair_t:
+    members: [qwen3-30b-a3b, gemma-4-26b-a4b]
+    holds_fixed: [n_routed_experts_128, top_k_8]
+    not_matched: [gemma_parallel_dense_mlp, hidden_dim, expert_ffn_width, vocabulary, attention,
+                  checkpoint_status]
+    framing: "matched routed-expert count and top-k, across two independent training pipelines"
+  pair_a:
+    members: [olmoe-0924, olmoe-0125]
+    holds_fixed: [architecture, tokenizer, vocabulary, checkpoint_status, aux_loss_coef]
+    not_matched: [annealing_100B_tokens]
+    framing: "genuinely controlled; the only pair where F1 conditions on an identical variable"

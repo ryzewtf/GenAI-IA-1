@@ -1,0 +1,92 @@
+# Pinned runtime configuration.
+#
+# CONTRACT (plan S.3): every field below is hashed into `run_config_sha256`, which is written
+# into every shard manifest. Shards whose hashes differ are DIFFERENT EXPERIMENTS and merging
+# them must be a hard error. Change a value here only with intent, and never mid-collection.
+#
+# The hash is computed by src/runtime/config.py over the canonical serialization of the
+# `hashed` block below. Fields under `unhashed` are operational and do not affect numerics.
+
+schema_version: 1
+
+hashed:
+  # --- platform -------------------------------------------------------------------------
+  # Plan invariant I3 (added v2.1-impl): the plan assumed a single hardware target. We have two
+  # (Kaggle T4 sm_75, local RTX 5060 Ti sm_120). Kernel selection differs by architecture, so
+  # platform belongs in the hash. Set per collection campaign.
+  platform:
+    gpu_arch: 75              # 75 = Turing/T4 (Kaggle) | 120 = Blackwell/RTX 5060 Ti (local)
+    n_devices: 2
+
+  # --- build ----------------------------------------------------------------------------
+  build:
+    # Load-bearing for CORRECTNESS, not only reproducibility: build_moe_ffn selects experts with
+    # ggml_argsort_top_k, which is ggml_argsort followed by ggml_view_4d retaining the parent's
+    # nb[1]. `ffn_moe_topk` is therefore a STRIDED VIEW (ne[0]==top_k, nb[1]==n_experts*4), and a
+    # contiguous read of it yields in-range, top_k-distinct, plausible-but-wrong labels for every
+    # token after the first. Older trees used ggml_top_k (GGML_OP_TOP_K, contiguous). Verified by
+    # reading ggml/src/ggml.c at this commit; the callback de-strides unconditionally either way.
+    llama_cpp_commit: 7077abbe14c510cb829c93a1328c2815b5805ebd
+    ggml_native: false        # -DGGML_NATIVE=OFF — mandatory, see T0.2 (SIGILL on host change)
+    ggml_cuda_f16: false      # -DGGML_CUDA_F16=OFF — do not add a precision variable
+    cuda_architectures: "75"
+
+  # --- inference flags ------------------------------------------------------------------
+  # Every one of these is a numerics-visible knob. Pinned, not defaulted.
+  inference:
+    ctx_size: 2048            # -c   MANDATORY everywhere (I4; Gemma 4 defaults to 262144)
+    batch_size: 2048          # -b
+    ubatch_size: 512          # -ub
+    n_gpu_layers: 99          # -ngl  never reduce "to help"; CPU layers on 4 vCPU are worse
+    n_threads: 4              # -t    matches Kaggle vCPU count; override for local
+    flash_attn: true          # -fa   pinned explicitly; an unpinned default is a silent confound
+    split_mode: layer         # --split-mode  (tensor is EXPERIMENTAL and arch-gated)
+    tensor_split: [0.5, 0.5]  # pinned; auto-split varies with free VRAM between sessions
+    no_warmup: true
+    override_tensor: null     # no --override-tensor at collection; router stays on GPU (§0b)
+    mmap: true
+    # GGML_CUDA_DISABLE_FUSION=1 for every capture run. The CUDA backend fuses the softmax +
+    # argsort + top-k chain into one "topk-moe" kernel, and the capture design depends on
+    # `ffn_moe_topk` being a materialised tensor the eval callback can read. It should be safe
+    # without this -- when cb_eval is set, ggml computes a graph VIEW ending at each requested
+    # node, so a requested node is always a fusion output and never an absorbed intermediate --
+    # but that is an internal detail of the scheduler, and the failure mode if it changes is
+    # missing rows rather than an error. Cost is small here because capture is prefill-only and
+    # prefill is compute-bound on the expert matmuls; T0.5 measures it.
+    disable_cuda_fusion: true
+
+  # --- capture ---------------------------------------------------------------------------
+  capture:
+    mode: prefill_only        # no autoregressive generation (§0b, verified in T3.8)
+    clear_kv_between_docs: true   # this is what makes document-level sharding bit-exact
+    hidden_subsample_n: 50000     # O2; fallback ladder in T4.4 — never drop topk.bin
+    streams: [tokens, topk, logits, hidden]
+
+  # --- analysis ----------------------------------------------------------------------------
+  analysis:
+    epsilon_mix: 1.0e-6       # §1.2 — guarantees FINITE CE, NOT non-negative Î. Do not tune.
+    entropy_estimator: miller_madow
+    clamp_mi_at_zero: false   # I8 — negative Î is diagnostic, reporting it is the policy
+
+unhashed:
+  # Operational only. Changing these does not invalidate a shard.
+  session:
+    wall_limit_s: 43200       # 12 h Kaggle batch cap
+    reserve_s: 1800           # flush + upload headroom before the cap
+  preflight:
+    scratch_probe_bytes: 2147483648      # 2 GB, actually written and fsynced (T0.6)
+    min_write_mbps: 50                   # T0.1 measured 206 MB/s on working, 193 MB/s on /tmp
+    # A free-space floor, checked before the throughput probe. The probe alone cannot tell the
+    # big scratch disk from the small overlay -- 2 GB fits on both. T0.1: /kaggle/working and
+    # /kaggle/input report 19.5 GiB, /tmp reports 1026.8 GiB free of 8062.4 GiB.
+    min_free_gb: 100
+  paths:
+    # T0.1 (2026-08-18) found NO /kaggle/temp in the current Kaggle image: it is absent from
+    # both the mount table and the throughput probe, which skip anything that is not a
+    # directory. The previous value here was /kaggle/temp, and preflight would have created it
+    # -- on the 19.5 GiB overlay -- and passed. /tmp is the only large writable mount.
+    scratch: /tmp/moe
+    working: /kaggle/working
+  upload:
+    backend: hf               # traces to HF Hub, never to /kaggle/working (I9)
+    verify_round_trip: true   # SHA256 after download-back, before marking a shard complete
