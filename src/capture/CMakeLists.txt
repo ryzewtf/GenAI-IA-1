@@ -19,9 +19,30 @@ project(moe_trace CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Where to look when -DLLAMA_CPP_DIR is not given. The source tree is gitignored and lives
+# wherever the operator put it, so a single hardcoded path turns "I tidied my checkout" into a
+# build break -- which is exactly what happened when the tree moved under .vendor/. An explicit
+# -DLLAMA_CPP_DIR always wins; this only fills in the blank.
+set(MOE_TRACE_LLAMA_CANDIDATES
+    "${CMAKE_CURRENT_LIST_DIR}/../../.vendor/llama_cpp_pull"
+    "${CMAKE_CURRENT_LIST_DIR}/../../llama_cpp_pull"
+    "${CMAKE_CURRENT_LIST_DIR}/../../.vendor/llama.cpp"
+    "$ENV{LLAMA_CPP_DIR}")
+
+if(NOT DEFINED LLAMA_CPP_DIR)
+    foreach(candidate IN LISTS MOE_TRACE_LLAMA_CANDIDATES)
+        if(candidate AND EXISTS "${candidate}/include/llama.h")
+            get_filename_component(LLAMA_CPP_DIR "${candidate}" ABSOLUTE)
+            message(STATUS "moe_trace: discovered LLAMA_CPP_DIR=${LLAMA_CPP_DIR}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 if(NOT DEFINED LLAMA_CPP_DIR)
     message(FATAL_ERROR
         "LLAMA_CPP_DIR is required: -DLLAMA_CPP_DIR=/path/to/llama.cpp\n"
+        "Looked in: ${MOE_TRACE_LLAMA_CANDIDATES}\n"
         "Pin the commit and record it in BUILD_COMMIT.txt (plan T0.2). The commit is load-bearing "
         "for correctness, not only reproducibility: build_moe_ffn switched from ggml_top_k (a "
         "contiguous op) to ggml_argsort_top_k (a strided view), and the callback's read path "
@@ -29,7 +50,14 @@ if(NOT DEFINED LLAMA_CPP_DIR)
 endif()
 
 if(NOT EXISTS "${LLAMA_CPP_DIR}/include/llama.h")
-    message(FATAL_ERROR "no include/llama.h under LLAMA_CPP_DIR=${LLAMA_CPP_DIR}")
+    # A CACHED value that no longer resolves means the tree moved after the build dir was
+    # configured. Say that, because the reflex is to re-pass the flag -- which CMake then ignores
+    # in favour of the stale cache entry, and the same error comes back.
+    message(FATAL_ERROR
+        "no include/llama.h under LLAMA_CPP_DIR=${LLAMA_CPP_DIR}\n"
+        "If the llama.cpp tree moved, this path is probably a stale CMake cache entry: delete the "
+        "build directory (or re-run with -DLLAMA_CPP_DIR=<new path>), since re-passing the flag "
+        "alone does not override an existing cache value.")
 endif()
 
 # Two upstream binaries are load-bearing for the plan, and at commit 7077abbe they live in
@@ -41,6 +69,28 @@ endif()
 # moe_trace links only llama + ggml, so this whole group is optional. It is worth turning OFF for a
 # collection-only session (Kaggle, 12 h cap): common drags in vendor/cpp-httplib and the two tool
 # trees are several minutes of compile for binaries a collection run never invokes.
+# GGML_NATIVE is forced OFF here rather than left to the caller, and ON is refused outright.
+#
+# ggml defaults it to ON, and `configs/run.yaml` pins `build.ggml_native: false` inside
+# `run_config_sha256`. setup_kaggle.py passes -DGGML_NATIVE=OFF, but a hand-run cmake does not, and
+# the failure is silent: the binary builds, runs, and produces DIFFERENT ROUTING.
+#
+# Measured, not assumed. Building this exact tree twice on one machine -- once with the ggml default
+# and once with OFF -- and capturing the same 12-document corpus gives byte-identical topk.bin,
+# logits.bin and hidden.bin for OFF against the reference trace, and three differing files for ON.
+# Same host, same corpus, same commit; only -march=native separates them. That is precisely what
+# T3.6's cross-session byte-identity gate would trip over on Kaggle, where the host CPU is not
+# guaranteed to be the same between sessions -- except it would trip over it after collection.
+if(DEFINED GGML_NATIVE AND GGML_NATIVE)
+    message(FATAL_ERROR
+        "GGML_NATIVE=ON is refused. A -march=native binary selects SIMD paths for the CPU that "
+        "compiled it, and that changes captured routing: this tree built with the ggml default "
+        "produces different topk.bin/logits.bin/hidden.bin than the same tree built with "
+        "GGML_NATIVE=OFF, on one machine. configs/run.yaml pins build.ggml_native: false and the "
+        "value is inside run_config_sha256 (plan T0.2, T3.6).")
+endif()
+set(GGML_NATIVE OFF CACHE BOOL "forced OFF: -march=native changes captured routing (T0.2)" FORCE)
+
 option(MOE_TRACE_UPSTREAM_TOOLS "also build llama-eval-callback (T1.4) and llama-bench (T0.5)" ON)
 
 # LLAMA_BUILD_TESTS stays OFF unconditionally: the test suite downloads a GGUF at configure time.

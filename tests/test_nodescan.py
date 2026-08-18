@@ -374,3 +374,94 @@ def test_run_and_from_log_are_mutually_exclusive_so_a_model_load_is_never_implic
 def test_run_requires_an_explicit_gguf_path(tmp_path):
     with pytest.raises(SystemExit):
         main(["olmoe-test", "--models", str(_models_yaml(tmp_path)), "--run"])
+
+
+# -- write_back (T1.4 -> models.yaml) ------------------------------------------------------------
+
+
+class _Report:
+    """Just the fields write_back reads."""
+
+    def __init__(self, logits="ffn_moe_probs-%d", topk="ffn_moe_topk-%d",
+                 router_input="ffn_norm-%d", selection="ffn_moe_probs"):
+        self.node_logits = logits
+        self.node_topk = topk
+        self.node_router_input = router_input
+        self.selection_node = selection
+
+
+def _models_copy(tmp_path):
+    import shutil
+    dst = tmp_path / "models.yaml"
+    shutil.copy("configs/models.yaml", dst)
+    return dst
+
+
+def test_write_back_fills_an_unset_model(tmp_path):
+    import yaml
+    from src.capture.nodescan import write_back
+
+    path = _models_copy(tmp_path)
+    changes = write_back(path, "qwen3-30b-a3b", _Report())
+    assert len(changes) == 2
+
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))["models"]["qwen3-30b-a3b"]
+    assert loaded["node_names"]["logits"] == "ffn_moe_probs-%d"
+    assert loaded["logit_tensor_used"] == "ffn_moe_probs"
+
+
+def test_write_back_is_idempotent(tmp_path):
+    from src.capture.nodescan import write_back
+
+    path = _models_copy(tmp_path)
+    write_back(path, "qwen3-30b-a3b", _Report())
+    assert write_back(path, "qwen3-30b-a3b", _Report()) == []
+
+
+def test_write_back_keeps_the_file_valid_yaml_across_a_multiline_value(tmp_path):
+    """OLMoE's node_names is written over two lines. Replacing only the first orphans the
+    continuation and the file stops parsing — a corruption with no symptom until the next session
+    loads the config, by which point it is not obvious what did it."""
+    import yaml
+    from src.capture.nodescan import write_back
+
+    path = _models_copy(tmp_path)
+    raw = path.read_text(encoding="utf-8")
+    assert "topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}" in raw, "fixture assumption"
+
+    write_back(path, "olmoe-0125-instruct", _Report(logits="ffn_moe_logits-%d",
+                                                    selection="ffn_moe_logits"), force=True)
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert loaded["models"]["olmoe-0125-instruct"]["logit_tensor_used"] == "ffn_moe_logits"
+    assert loaded["models"]["gemma-4-26b-a4b"]["gguf"]["file"], "other models must be untouched"
+
+
+def test_write_back_refuses_to_silently_change_a_recorded_node(tmp_path):
+    """A node name that differs between two scans of the same checkpoint means the build or the
+    artifact moved, and every trace already collected under the old name is a different
+    experiment (I13). Overwriting it quietly is how that becomes invisible."""
+    from src.capture.nodescan import NodeScanError, write_back
+
+    path = _models_copy(tmp_path)
+    with pytest.raises(NodeScanError, match="already records"):
+        write_back(path, "olmoe-0125-instruct",
+                   _Report(logits="ffn_moe_logits-%d", selection="ffn_moe_logits"))
+
+
+def test_write_back_preserves_comments(tmp_path):
+    """models.yaml is more comment than data — the T1.2 gate result, the pair structure, the
+    GPT-OSS requantization warning. A round trip through PyYAML would delete all of it."""
+    from src.capture.nodescan import write_back
+
+    path = _models_copy(tmp_path)
+    write_back(path, "qwen3-30b-a3b", _Report())
+    text = path.read_text(encoding="utf-8")
+    assert "GATE PASSED" in text
+    assert "CONFLICTS WITH A FROZEN DECISION" in text
+
+
+def test_write_back_names_an_unknown_model(tmp_path):
+    from src.capture.nodescan import NodeScanError, write_back
+
+    with pytest.raises(NodeScanError, match="no block for model"):
+        write_back(_models_copy(tmp_path), "not-a-model", _Report())

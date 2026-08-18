@@ -47,6 +47,7 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "gguf.h"
 
 #include "node_spec.hpp"
 #include "trace_writer.hpp"
@@ -55,6 +56,10 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <list>
+#include <map>
+#include <regex>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -244,6 +249,25 @@ bool moe_cb(ggml_tensor * t, bool ask, void * user_data) {
 // ggml_backend_sched executes a graph regardless of what the callback answers. Separating
 // `no_callback` from `filter_off` splits that into "the cost of being observable at all" and "the
 // cost of actually observing", and the two have different remedies if the ratio is bad.
+// T3.8. The plan asks whether prefill routing equals decode routing; §0b asserts it does and
+// every result in the paper is a prefill measurement being read as a claim about decode-time
+// prefetching. Two candidate legs, not one, because they answer different questions:
+//
+//   full  -- every token is its own single-token forward. Maximal batch-size contrast, so it
+//            isolates "does kernel selection depend on batch size" in the cleanest possible way.
+//            No deployment runs this way.
+//   tail  -- one prefill batch of `decode_prefix` tokens, then single-token steps for the rest.
+//            This IS how serving works, so it is the leg that speaks to the prefetching claim.
+//
+// Both retain the KV cache across steps within a document and clear it between documents, exactly
+// as the prefill path does -- that is what keeps the comparison honest, since a cleared cache
+// mid-document would change attention, not just batching.
+enum class decode_mode {
+    off,   // one batch of n tokens (collection default)
+    full,  // n batches of 1 token
+    tail,  // one batch of decode_prefix tokens, then singles
+};
+
 enum class capture_mode {
     full,        // normal collection: request nodes, read them, write the trace
     filter_off,  // cb_eval installed, nothing requested, nothing written
@@ -268,6 +292,9 @@ struct options {
     bool flash_attn = true;
     bool split_mode_row = false;
     capture_mode mode = capture_mode::full;
+    decode_mode decode = decode_mode::off;
+    int decode_prefix = 512;
+    std::vector<std::string> override_tensor;  // raw "PATTERN=BUFTYPE" strings, upstream syntax
 
     bool writes_trace() const { return mode == capture_mode::full; }
 };
@@ -301,6 +328,24 @@ bool parse_args(int argc, char ** argv, options & o) {
         else if (a == "--shard-id") ok = next_int(o.shard_id);
         else if (a == "--tensor-split") ok = next(o.tensor_split);
         else if (a == "--split-mode-row") o.split_mode_row = true;
+        else if (a == "--override-tensor" || a == "-ot") {
+            std::string raw;
+            if (!next(raw)) { ok = false; }
+            else o.override_tensor.push_back(raw);
+        }
+        else if (a == "--decode-mode") {
+            std::string raw;
+            if (!next(raw)) { ok = false; }
+            else if (raw == "off")  o.decode = decode_mode::off;
+            else if (raw == "full") o.decode = decode_mode::full;
+            else if (raw == "tail") o.decode = decode_mode::tail;
+            else {
+                fprintf(stderr, "moe_trace: --decode-mode must be off, full or tail (got %s)\n",
+                        raw.c_str());
+                return false;
+            }
+        }
+        else if (a == "--decode-prefix") ok = next_int(o.decode_prefix);
         else if (a == "--capture-mode") {
             std::string raw;
             if (!next(raw)) { ok = false; }
@@ -339,6 +384,10 @@ bool parse_args(int argc, char ** argv, options & o) {
     }
     if (o.writes_trace() && o.out_dir.empty()) {
         fprintf(stderr, "moe_trace: --out is required unless --capture-mode is a timing mode\n");
+        return false;
+    }
+    if (o.decode == decode_mode::tail && o.decode_prefix < 1) {
+        fprintf(stderr, "moe_trace: --decode-prefix must be >= 1 for --decode-mode tail\n");
         return false;
     }
     if (o.stats_path.empty()) {
@@ -496,6 +545,105 @@ bool load_corpus(const std::string & path, std::vector<document> & out, std::str
     return ok;
 }
 
+// T3.7. Upstream's `--override-tensor` accepts "PATTERN=BUFTYPE" and applies it with
+// std::regex_search over the GGUF tensor names at load time. It does NOT check that the pattern
+// matched anything -- a typo, a shell that ate the backslashes, or an architecture that names its
+// router differently all yield a run that looks completely normal and silently measures the
+// baseline against itself. For a *validation gate* that is the worst possible failure: T3.7's
+// acceptance is >=99.9% agreement, and a no-op override scores exactly 100%.
+//
+// So the patterns are pre-matched against the GGUF's own tensor list here, before the model is
+// loaded, and a pattern that matches nothing is fatal. The metadata-only gguf_init_from_file is
+// cheap: it reads the header, not the weights.
+struct buft_override_plan {
+    std::vector<llama_model_tensor_buft_override> entries;  // NULL-terminated for llama.cpp
+    std::list<std::string> patterns;                        // owns the strings entries point at
+    std::vector<int> match_counts;
+    std::vector<std::string> buft_names;
+};
+
+bool build_buft_overrides(const std::vector<std::string> & specs, const std::string & model_path,
+                          buft_override_plan & plan, std::string & err) {
+    if (specs.empty()) return true;
+
+    ggml_backend_load_all();
+
+    std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev)) {
+            buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+    }
+
+    // Tensor names straight out of the GGUF. llama.cpp matches against exactly these strings.
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * gctx = gguf_init_from_file(model_path.c_str(), gp);
+    if (!gctx) {
+        err = "cannot read GGUF metadata from " + model_path + " to verify --override-tensor";
+        return false;
+    }
+    std::vector<std::string> tensor_names;
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    tensor_names.reserve((size_t) n_tensors);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        tensor_names.emplace_back(gguf_get_tensor_name(gctx, i));
+    }
+    gguf_free(gctx);
+
+    for (const std::string & spec : specs) {
+        // Upstream splits one argument on ',' into several overrides; match that so the plan's
+        // command lines are copy-pasteable.
+        size_t start = 0;
+        while (start <= spec.size()) {
+            const size_t comma = spec.find(',', start);
+            const std::string one = spec.substr(start, comma - start);
+            if (comma == std::string::npos) start = spec.size() + 1; else start = comma + 1;
+            if (one.empty()) continue;
+
+            const size_t eq = one.find('=');
+            if (eq == std::string::npos) {
+                err = "--override-tensor needs PATTERN=BUFTYPE, got '" + one + "'";
+                return false;
+            }
+            const std::string pattern = one.substr(0, eq);
+            const std::string buft_name = one.substr(eq + 1);
+
+            auto it = buft_list.find(buft_name);
+            if (it == buft_list.end()) {
+                err = "unknown buffer type '" + buft_name + "'. Available:";
+                for (const auto & kv : buft_list) err += " " + kv.first;
+                return false;
+            }
+
+            int matched = 0;
+            try {
+                const std::regex re(pattern);
+                for (const std::string & name : tensor_names) {
+                    if (std::regex_search(name, re)) matched++;
+                }
+            } catch (const std::regex_error & e) {
+                err = "--override-tensor pattern '" + pattern + "' is not a valid regex: " + e.what();
+                return false;
+            }
+            if (matched == 0) {
+                err = "--override-tensor pattern '" + pattern + "' matches none of the " +
+                      std::to_string(tensor_names.size()) + " tensors in " + model_path +
+                      ". A no-op override would compare the baseline against itself and score "
+                      "100% on a gate that exists to detect a difference.";
+                return false;
+            }
+
+            plan.patterns.push_back(pattern);
+            plan.entries.push_back({ plan.patterns.back().c_str(), it->second });
+            plan.match_counts.push_back(matched);
+            plan.buft_names.push_back(buft_name);
+        }
+    }
+    plan.entries.push_back({ nullptr, nullptr });  // llama.cpp scans until pattern == nullptr
+    return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -552,6 +700,21 @@ int main(int argc, char ** argv) {
         mparams.tensor_split = splits.data();
     }
 
+    buft_override_plan buft_plan;
+    if (!build_buft_overrides(opt.override_tensor, opt.model_path, buft_plan, err)) {
+        fprintf(stderr, "moe_trace: %s\n", err.c_str());
+        llama_backend_free();
+        return 2;
+    }
+    if (!buft_plan.entries.empty()) {
+        mparams.tensor_buft_overrides = buft_plan.entries.data();
+        for (size_t i = 0; i + 1 < buft_plan.entries.size(); ++i) {
+            fprintf(stderr, "moe_trace: override '%s' -> %s (%d tensor(s))\n",
+                    buft_plan.entries[i].pattern, buft_plan.buft_names[i].c_str(),
+                    buft_plan.match_counts[i]);
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(opt.model_path.c_str(), mparams);
     if (!model) {
         fprintf(stderr, "moe_trace: cannot load model %s\n", opt.model_path.c_str());
@@ -600,6 +763,7 @@ int main(int argc, char ** argv) {
     // the 1M-token collection it is meant to predict.
     double decode_seconds = 0.0;
     uint64_t n_tokens_decoded = 0;
+    uint64_t n_decode_steps = 0;
 
     for (const document & doc : corpus) {
         tokens.resize((size_t) opt.n_ctx);
@@ -684,19 +848,46 @@ int main(int argc, char ** argv) {
         //
         // The cost is the lm_head matmul over all n tokens instead of one, which is exactly what
         // llama-perplexity pays; it buys the layer back, and nothing cheaper does.
-        batch.n_tokens = n;
-        for (int i = 0; i < n; ++i) {
-            batch.token[i]     = tokens[(size_t) i];
-            batch.pos[i]       = i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = 1;
+        // How this document is broken into forward passes. One span for prefill; a prefill span
+        // plus one span per remaining token for `tail`; one span per token for `full`. The KV
+        // cache is NOT cleared between spans -- only between documents -- so the model sees the
+        // same causal context either way and only the batching differs, which is the single
+        // variable T3.8 is asking about.
+        std::vector<std::pair<int, int>> spans;  // (start, count)
+        switch (opt.decode) {
+            case decode_mode::off:
+                spans.emplace_back(0, n);
+                break;
+            case decode_mode::full:
+                for (int i = 0; i < n; ++i) spans.emplace_back(i, 1);
+                break;
+            case decode_mode::tail: {
+                const int prefix = opt.decode_prefix < n ? opt.decode_prefix : n;
+                spans.emplace_back(0, prefix);
+                for (int i = prefix; i < n; ++i) spans.emplace_back(i, 1);
+                break;
+            }
         }
-        const auto t_decode0 = std::chrono::steady_clock::now();
-        const int32_t decoded = llama_decode(ctx, batch);
-        decode_seconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_decode0).count();
-        n_tokens_decoded += (uint64_t) n;
+        n_decode_steps += (uint64_t) spans.size();
+
+        int32_t decoded = 0;
+        for (const auto & span : spans) {
+            batch.n_tokens = span.second;
+            for (int j = 0; j < span.second; ++j) {
+                const int i = span.first + j;
+                batch.token[j]     = tokens[(size_t) i];
+                batch.pos[j]       = i;
+                batch.n_seq_id[j]  = 1;
+                batch.seq_id[j][0] = 0;
+                batch.logits[j]    = 1;
+            }
+            const auto t_decode0 = std::chrono::steady_clock::now();
+            decoded = llama_decode(ctx, batch);
+            decode_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_decode0).count();
+            n_tokens_decoded += (uint64_t) span.second;
+            if (decoded != 0) break;
+        }
         if (decoded != 0) {
             fprintf(stderr, "moe_trace: llama_decode returned %d on doc %u\n", decoded, doc.doc_id);
             rc = 5;
@@ -760,6 +951,14 @@ int main(int argc, char ** argv) {
                 (unsigned long long) n_tokens_dropped, first_truncated_doc);
     }
 
+    // Recorded verbatim so the manifest can carry what was actually asked for, not a
+    // reconstruction. An empty string means the baseline placement.
+    std::string override_tensor_joined;
+    for (const std::string & one : opt.override_tensor) {
+        if (!override_tensor_joined.empty()) override_tensor_joined += ",";
+        override_tensor_joined += one;
+    }
+
     // Stats go to a file, not to stdout, so the runner parses data rather than scraping logs.
     if (FILE * sf = fopen(opt.stats_path.c_str(), "wb")) {
         fprintf(sf,
@@ -786,6 +985,10 @@ int main(int argc, char ** argv) {
                 "  \"node_logits\": \"%s\",\n"
                 "  \"node_router_input\": \"%s\",\n"
                 "  \"capture_mode\": \"%s\",\n"
+                "  \"decode_mode\": \"%s\",\n"
+                "  \"decode_prefix\": %d,\n"
+                "  \"n_decode_steps\": %llu,\n"
+                "  \"override_tensor\": \"%s\",\n"
                 "  \"decode_seconds\": %.6f,\n"
                 "  \"n_tokens_decoded\": %llu,\n"
                 "  \"prefill_tok_per_s\": %.3f,\n"
@@ -805,6 +1008,11 @@ int main(int argc, char ** argv) {
                 st.spec.tpl_router_input.c_str(),
                 opt.mode == capture_mode::full ? "full"
                     : (opt.mode == capture_mode::filter_off ? "filter-off" : "no-callback"),
+                opt.decode == decode_mode::off ? "off"
+                    : (opt.decode == decode_mode::full ? "full" : "tail"),
+                opt.decode == decode_mode::tail ? opt.decode_prefix : 0,
+                (unsigned long long) n_decode_steps,
+                override_tensor_joined.c_str(),
                 decode_seconds, (unsigned long long) n_tokens_decoded,
                 decode_seconds > 0.0 ? (double) n_tokens_decoded / decode_seconds : 0.0,
                 rc);

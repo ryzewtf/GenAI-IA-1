@@ -62,6 +62,8 @@ __all__ = [
     "inventory_by_layer",
     "confirm_nodes",
     "run_eval_callback",
+    "write_back",
+    "set_model_fields",
     "main",
 ]
 
@@ -467,6 +469,123 @@ def _load_model_config(models_path: Path | str, key: str) -> dict[str, object]:
     return cfg
 
 
+def write_back(models_path: Path | str, model_key: str, report: "NodeScanReport",
+               *, force: bool = False) -> list[str]:
+    """Record a confirmed T1.4 result into ``configs/models.yaml``, in place.
+
+    A thin wrapper over :func:`set_model_fields`, which does the editing. The split exists because
+    T1.1 has the same problem for a different set of fields (``gguf``, ``quant``), and a second
+    hand-rolled YAML editor is a second place for the multi-line-flow-mapping bug below to be
+    reintroduced without its regression test noticing.
+    """
+    return set_model_fields(
+        models_path,
+        model_key,
+        {
+            "node_names": (
+                f"{{logits: {report.node_logits}, logits_biased: "
+                f"{getattr(report, 'node_logits_biased', None) or 'null'}, "
+                f"topk: {report.node_topk}, router_input: {report.node_router_input}}}"
+            ),
+            "logit_tensor_used": report.selection_node,
+        },
+        force=force,
+    )
+
+
+def set_model_fields(models_path: Path | str, model_key: str,
+                     wanted: "Mapping[str, str]", *, force: bool = False) -> list[str]:
+    """Set top-level scalar/flow fields on one model block in ``configs/models.yaml``, in place.
+
+    Line-based rather than ``yaml.safe_load`` + ``safe_dump``: models.yaml is more comment than
+    data — the T1.2 gate result, the §1.5 pair structure, the GPT-OSS requantization warning — and
+    a round trip through PyYAML would silently delete all of it.
+
+    **An existing value that disagrees is an error, not something to overwrite.** A node name that
+    changed between two scans of the same checkpoint means either the llama.cpp build moved or the
+    artifact did, and both invalidate every trace already collected under the old name. Re-running
+    discovery is cheap; discovering afterwards that half the panel used a different selection node
+    (invariant I13) is not. ``force`` exists for the deliberate case and says so in the diff.
+    """
+    path = Path(models_path)
+    raw = path.read_text(encoding="utf-8", newline="")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.replace("\r\n", "\n").split("\n")
+
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == f"{model_key}:")
+    except StopIteration as exc:
+        raise NodeScanError(f"{path}: no block for model {model_key!r}") from exc
+
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    stop = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if (len(lines[i]) - len(lines[i].lstrip())) <= indent:
+            stop = i
+            break
+
+    changes: list[str] = []
+    # Rebuilt after each replacement, because a multi-line value collapses to one line and shifts
+    # every index after it.
+    for key, value in wanted.items():
+        target = None
+        for i in range(start + 1, stop):
+            if lines[i].lstrip().startswith(f"{key}:"):
+                target = i
+                break
+        if target is None:
+            raise NodeScanError(f"{path}: {model_key} has no {key}: line to update")
+
+        # A flow mapping may be wrapped across lines -- models.yaml already writes OLMoE's
+        # node_names over two. Replacing only the first line leaves the continuation orphaned and
+        # the file stops being valid YAML, which is a corruption that no test of THIS function
+        # would notice: it parses fine right up until someone loads the config.
+        last = target
+        current = lines[target].split(":", 1)[1].split("#")[0].strip()
+        if current.startswith("{") and current.count("{") > current.count("}"):
+            depth = current.count("{") - current.count("}")
+            while depth > 0 and last + 1 < stop:
+                last += 1
+                piece = lines[last].split("#")[0].strip()
+                current += " " + piece
+                depth += piece.count("{") - piece.count("}")
+            if depth > 0:
+                raise NodeScanError(
+                    f"{path}: {model_key}.{key} opens a flow mapping that never closes"
+                )
+        if current == value:
+            continue
+        # "Unset" is a bare null, or a node_names mapping whose every value is null. Both are what
+        # a model looks like before T1.4 has run, and neither is a prior claim worth protecting.
+        if current.startswith("{"):
+            unset = all(
+                piece.split(":", 1)[-1].strip() in ("null", "")
+                for piece in current.strip("{}").split(",")
+                if piece.strip()
+            )
+        else:
+            unset = current in ("", "null")
+        if not unset and not force:
+            raise NodeScanError(
+                f"{path}: {model_key}.{key} already records {current!r} but this scan found "
+                f"{value!r}. A node name that changed between two scans of the same checkpoint "
+                "means the build or the artifact moved, and every trace collected under the old "
+                "name is a different experiment (invariant I13). Investigate, then pass --force "
+                "if the change is intended."
+            )
+        pad = " " * (len(lines[target]) - len(lines[target].lstrip()))
+        lines[target : last + 1] = [f"{pad}{key}: {value}"]
+        stop -= last - target
+        changes.append(f"{key}: {current or '(empty)'} -> {value}")
+
+    if changes:
+        path.write_text(newline.join(lines), encoding="utf-8", newline="")
+    return changes
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="nodescan",
@@ -483,6 +602,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--gguf", type=Path, help="path to the GGUF (required with --run)")
     ap.add_argument("--save-log", type=Path, help="write the raw dump here for re-parsing")
     ap.add_argument("--router-input", help="force the router-input base name")
+    ap.add_argument("--write", action="store_true",
+                    help="record the confirmed node names back into configs/models.yaml")
+    ap.add_argument("--force", action="store_true",
+                    help="with --write, allow overwriting a DIFFERENT recorded value")
     args = ap.parse_args(argv)
 
     try:
@@ -508,6 +631,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\nT1.4 is a HALT GATE. Fix the node filter before writing a byte of trace.",
               file=sys.stderr)
         return 1
+    if args.write:
+        try:
+            changes = write_back(args.models, args.model_key, report, force=args.force)
+        except NodeScanError as exc:
+            print(f"T1.4 could not update {args.models}: {exc}", file=sys.stderr)
+            return 1
+        if changes:
+            print(f"\nUpdated {args.models} for {args.model_key}:")
+            for line in changes:
+                print(f"  {line}")
+        else:
+            print(f"\n{args.models} already matches this scan for {args.model_key}.")
+        return 0
+
     print(f"\nRecord in models.yaml under {args.model_key}:")
     print(f"  node_names: {{logits: {report.node_logits}, logits_biased: null, "
           f"topk: {report.node_topk}, router_input: {report.node_router_input}}}")

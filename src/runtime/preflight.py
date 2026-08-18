@@ -212,7 +212,7 @@ def _finish(
     return result
 
 
-def check_upload_credentials(run_config: Any) -> None:
+def check_upload_credentials(run_config: Any, *, backend: str | None = None) -> None:
     """Fail now if the configured upload backend has no credentials.
 
     Added after T0.1, which reported ``HF_TOKEN`` and ``HUGGINGFACE_HUB_TOKEN`` both unset on a
@@ -222,8 +222,13 @@ def check_upload_credentials(run_config: Any) -> None:
     of GPU quota into a session whose scratch disk does not survive it (invariant I9).
     """
     unhashed = getattr(run_config, "unhashed", None) or {}
-    backend = str((unhashed.get("upload") or {}).get("backend", "")).lower()
-    if backend != "hf":
+    # The EFFECTIVE backend, which a caller may have overridden on the command line. Reading only
+    # the config would refuse a deliberate `--backend local` run for want of a token it will never
+    # use -- and the first instinct then is to disable the check, which is exactly the check you
+    # want alive for the real hf run.
+    if backend is None:
+        backend = str((unhashed.get("upload") or {}).get("backend", ""))
+    if str(backend).lower() != "hf":
         return
     from .upload import HF_TOKEN_ENV_VARS
 

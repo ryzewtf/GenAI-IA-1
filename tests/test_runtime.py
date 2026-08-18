@@ -315,3 +315,34 @@ def test_credential_gate_stays_out_of_the_way_of_other_backends(monkeypatch, tmp
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_TOKEN", raising=False)
     check_upload_credentials(RunConfig.load(path))  # must not raise
+
+
+def test_the_build_forces_ggml_native_off_rather_than_trusting_the_caller():
+    """T0.2 regression, measured rather than assumed.
+
+    ggml defaults GGML_NATIVE to ON. Building this tree twice on one machine — once with that
+    default, once with OFF — and capturing the same 12-document corpus produced byte-identical
+    topk.bin/logits.bin/hidden.bin for OFF against the reference trace and three differing files
+    for ON. Same host, same corpus, same commit; only -march=native between them. setup_kaggle.py
+    passes the flag, but a hand-run cmake does not, and the failure is silent: it builds, runs,
+    and routes differently. That is what T3.6's cross-session byte-identity gate exists to catch,
+    and it would catch it after collection.
+    """
+    text = open("src/capture/CMakeLists.txt", encoding="utf-8").read()
+    assert 'set(GGML_NATIVE OFF CACHE BOOL' in text and "FORCE)" in text, (
+        "the build must force GGML_NATIVE OFF, not rely on the caller passing it"
+    )
+    assert "GGML_NATIVE=ON is refused" in text
+
+
+def test_the_build_can_find_llama_cpp_without_being_told_where_it_is():
+    """The llama.cpp tree is gitignored and lives wherever the operator put it, so a single
+    hardcoded path turns 'I tidied my checkout' into a build break — which is what happened when
+    it moved under .vendor/."""
+    text = open("src/capture/CMakeLists.txt", encoding="utf-8").read()
+    assert "MOE_TRACE_LLAMA_CANDIDATES" in text
+    assert ".vendor/llama_cpp_pull" in text
+    assert "stale CMake cache entry" in text, (
+        "a cached path that no longer resolves must say so: re-passing -DLLAMA_CPP_DIR does not "
+        "override an existing cache value, so the obvious fix silently does nothing"
+    )

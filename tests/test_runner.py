@@ -29,7 +29,9 @@ from src.corpus.build import Document, load_corpus, write_corpus
 from src.corpus.spec import CorpusSpec
 from src.runtime.config import ConfigError, RunConfig
 from src.runtime.runner import (
+    BASELINE_VARIANT,
     INDEX_SCHEME,
+    CaptureVariant,
     RunnerError,
     ShardPlan,
     SubprocessInvoker,
@@ -876,3 +878,96 @@ def test_a_shard_cannot_be_collected_while_the_gguf_hash_is_still_unknown(
     )
     assert result.status == "failed" and "gguf_sha256" in result.error
     assert ledger.completed_ids() == set()
+
+
+# -- capture variants (T3.7 / T3.8) --------------------------------------------------------------
+
+
+def test_a_baseline_run_adds_no_flags(plans, tmp_path, config):
+    argv = build_argv(plans[0], config=config, binary="moe_trace", spec_path="unit.spec",
+                      model_path="m.gguf", out_dir=tmp_path / "out")
+    assert "--override-tensor" not in argv and "--decode-mode" not in argv
+    assert BASELINE_VARIANT.is_baseline
+
+
+def test_a_variant_appends_after_every_pinned_flag(plans, tmp_path, config):
+    """So a variant always reads as an ADDITION to the collection command line rather than an edit
+    to it — the pinned flags are what run_config_sha256 claims, and a variant must not disturb
+    them."""
+    variant = CaptureVariant(name="router-cpu",
+                             override_tensor=r"blk\.\d+\.ffn_gate_inp\.weight=CPU")
+    argv = build_argv(plans[0], config=config, binary="moe_trace", spec_path="unit.spec",
+                      model_path="m.gguf", out_dir=tmp_path / "out", variant=variant)
+    assert argv[-2:] == ["--override-tensor", r"blk\.\d+\.ffn_gate_inp\.weight=CPU"]
+    assert argv[argv.index("--ctx") + 1] == str(config.inference["ctx_size"])
+
+
+def test_the_decode_variants_spell_out_their_flags(plans, tmp_path, config):
+    full = CaptureVariant(name="decode-full", decode_mode="full")
+    assert full.argv() == ["--decode-mode", "full"]
+
+    tail = CaptureVariant(name="decode-tail", decode_mode="tail", decode_prefix=128)
+    assert tail.argv() == ["--decode-mode", "tail", "--decode-prefix", "128"]
+
+    argv = build_argv(plans[0], config=config, binary="moe_trace", spec_path="unit.spec",
+                      model_path="m.gguf", out_dir=tmp_path / "out", variant=tail)
+    assert argv[argv.index("--decode-mode") + 1] == "tail"
+
+
+def test_an_impossible_variant_is_refused_at_construction():
+    with pytest.raises(RunnerError, match="off, full or tail"):
+        CaptureVariant(decode_mode="turbo")
+    with pytest.raises(RunnerError, match="decode_prefix"):
+        CaptureVariant(decode_mode="tail", decode_prefix=0)
+
+
+def test_the_variant_serializes_for_the_manifest():
+    """It has to reach the manifest: run_config_sha256 does NOT cover these flags — they are not
+    in run.yaml — so without this field a T3.8 decode leg and a real collection shard would look
+    like the same experiment, and check_equivalence could not tell that anything varied."""
+    payload = CaptureVariant(name="decode-tail", decode_mode="tail", decode_prefix=64).to_json()
+    assert payload == {"name": "decode-tail", "override_tensor": None,
+                       "decode_mode": "tail", "decode_prefix": 64}
+    assert BASELINE_VARIANT.to_json()["decode_prefix"] == 0, (
+        "decode_prefix is meaningless unless the mode is 'tail'; reporting 512 there would look "
+        "like a pinned value that did something"
+    )
+
+
+def test_the_invoker_carries_the_variant_into_every_shard(tmp_path, config):
+    """Held on the invoker, not passed per shard: a run where some shards carried the variant and
+    some did not would be an unanalysable mixture that every downstream check reads as one
+    experiment."""
+    from src.runtime.runner import SubprocessInvoker
+
+    variant = CaptureVariant(name="decode-full", decode_mode="full")
+    invoker = SubprocessInvoker(tmp_path / "moe_trace", variant=variant)
+    assert invoker.variant is variant
+    assert SubprocessInvoker(tmp_path / "moe_trace").variant is BASELINE_VARIANT
+
+
+def test_a_dry_run_shows_the_command_line_that_would_actually_run(plans, spec_path, tmp_path, config):
+    """The dry run's whole value is fidelity. Printing a baseline invocation for a gate leg would
+    hide the one thing you dry-run in order to check."""
+    from src.runtime.runner import SubprocessInvoker, run_collection
+    from src.runtime.state import ShardState
+    from src.runtime.upload import LocalDirBackend
+
+    variant = CaptureVariant(name="router-cpu", override_tensor=r"blk\.\d+\.ffn_gate_inp\.weight=CPU")
+    outcome = run_collection(
+        plans,
+        config=config,
+        invoker=SubprocessInvoker(tmp_path / "moe_trace", variant=variant),
+        backend=LocalDirBackend(tmp_path / "out"),
+        ledger=ShardState.load_or_create(tmp_path / "state.json", "m", "c", config.sha256),
+        spec_path=spec_path,
+        model_path=tmp_path / "m.gguf",
+        scratch_root=tmp_path / "scratch",
+        remote_root="traces/m/c",
+        dry_run=True,
+        verbose=False,
+    )
+    assert outcome.dry_run_argv
+    for argv in outcome.dry_run_argv:
+        assert "--override-tensor" in argv
+        assert argv[argv.index("--override-tensor") + 1].endswith("=CPU")

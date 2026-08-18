@@ -64,6 +64,8 @@ __all__ = [
     "CaptureInvoker",
     "SubprocessInvoker",
     "ShardPlan",
+    "CaptureVariant",
+    "BASELINE_VARIANT",
     "ShardResult",
     "CollectionResult",
     "STATS_NAME",
@@ -306,6 +308,70 @@ def _write_shard_jsonl(path: Path, docs: Sequence[Document]) -> Path:
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class CaptureVariant:
+    """One deliberate departure from the pinned collection flags, for a validation gate.
+
+    T3.7, T3.8 and T8.5 each collect the same corpus twice with exactly one knob moved, then
+    require the routing to be unchanged. The moved knob is numerics-visible by definition — that is
+    the whole point — so it cannot be passed as a loose extra argument and forgotten. It is a named
+    object that goes into the manifest, so that:
+
+    * ``src.analysis.precision.check_equivalence`` can verify the two legs actually differ. Every
+      one of these gates scores a perfect 100% when the legs are secretly identical, which is the
+      worst failure a gate can have: indistinguishable from a pass.
+    * a variant trace can never be mistaken for a collection trace. ``run_config_sha256`` does not
+      cover these flags — they are not in ``run.yaml`` — so without this field a T3.8 decode leg
+      and a real shard would look like the same experiment.
+
+    The baseline is a variant too (:data:`BASELINE_VARIANT`), so every manifest carries the field
+    and "absent" means "collected before this existed" rather than "baseline".
+    """
+
+    name: str = "baseline"
+    #: Upstream ``--override-tensor`` syntax, ``PATTERN=BUFTYPE``. `moe_trace` refuses a pattern
+    #: that matches no tensor in the GGUF, so this cannot silently become a no-op.
+    override_tensor: str | None = None
+    #: ``off`` (one batch per document), ``full`` (one token per batch), ``tail`` (prefill a prefix,
+    #: then single tokens). See moe_trace.cpp for why T3.8 wants both candidate legs.
+    decode_mode: str = "off"
+    decode_prefix: int = 512
+
+    def __post_init__(self) -> None:
+        if self.decode_mode not in ("off", "full", "tail"):
+            raise RunnerError(
+                f"decode_mode must be off, full or tail, got {self.decode_mode!r}"
+            )
+        if self.decode_mode == "tail" and self.decode_prefix < 1:
+            raise RunnerError("decode_mode 'tail' needs decode_prefix >= 1")
+
+    @property
+    def is_baseline(self) -> bool:
+        return self.override_tensor is None and self.decode_mode == "off"
+
+    def argv(self) -> list[str]:
+        out: list[str] = []
+        if self.override_tensor:
+            out += ["--override-tensor", self.override_tensor]
+        if self.decode_mode != "off":
+            out += ["--decode-mode", self.decode_mode]
+            if self.decode_mode == "tail":
+                out += ["--decode-prefix", str(int(self.decode_prefix))]
+        return out
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "override_tensor": self.override_tensor,
+            "decode_mode": self.decode_mode,
+            "decode_prefix": self.decode_prefix if self.decode_mode == "tail" else 0,
+        }
+
+
+#: What a normal collection run uses. Named so the manifest records it explicitly.
+BASELINE_VARIANT = CaptureVariant()
+
+
 def build_argv(
     plan: ShardPlan,
     *,
@@ -315,6 +381,7 @@ def build_argv(
     model_path: Path | str,
     out_dir: Path | str,
     stats_path: Path | str | None = None,
+    variant: CaptureVariant = BASELINE_VARIANT,
 ) -> list[str]:
     """The exact `moe_trace` command line for one shard.
 
@@ -353,6 +420,10 @@ def build_argv(
     # that leaves flash_attn unpinned, so False here is a decision and not a default.
     if not inf.get("flash_attn", True):
         argv.append("--no-flash-attn")
+
+    # Last, and after every pinned flag, so a variant is always visible as an addition to the
+    # collection command line rather than as an edit to it.
+    argv += variant.argv()
     return argv
 
 
@@ -403,9 +474,19 @@ class SubprocessInvoker:
     actually read.
     """
 
-    def __init__(self, binary: Path | str, *, timeout_s: float | None = None) -> None:
+    def __init__(
+        self,
+        binary: Path | str,
+        *,
+        timeout_s: float | None = None,
+        variant: CaptureVariant = BASELINE_VARIANT,
+    ) -> None:
         self.binary = Path(binary)
         self.timeout_s = timeout_s
+        # Held on the invoker rather than passed per shard: a variant is a property of the whole
+        # collection leg, and a run where some shards carried it and some did not would be an
+        # unanalysable mixture that every downstream check would read as one experiment.
+        self.variant = variant
         self.calls: list[list[str]] = []
 
     def capture(
@@ -438,6 +519,7 @@ class SubprocessInvoker:
             model_path=model_path,
             out_dir=out_dir,
             stats_path=stats_path,
+            variant=self.variant,
         )
         self.calls.append(list(argv))
 
@@ -711,6 +793,7 @@ def build_shard_manifest(
     model: str,
     corpus: str,
     model_meta: Mapping[str, Any] | None = None,
+    variant: CaptureVariant = BASELINE_VARIANT,
 ) -> dict[str, Any]:
     """Write `manifest.json` beside the streams and return it.
 
@@ -750,6 +833,7 @@ def build_shard_manifest(
         "ref_token_offset": plan.ref_token_offset,
         "hidden_stride": plan.hidden_stride,
         "node_spec_verified": bool(spec.verified),
+        "capture_variant": variant.to_json(),
         "collected_utc": _utc_now(),
         # Kaggle sets this in a batch commit; absent locally, and the field is not merge-invariant
         # (it is excluded from file_sha256 for exactly that reason — see ShardUploadResult).
@@ -891,6 +975,7 @@ def run_shard(
             model=model,
             corpus=corpus,
             model_meta=model_meta,
+            variant=_invoker_variant(invoker),
         )
 
         # verify=True and delete_local_on_success=True together are the S.3 step-d ordering:
@@ -995,6 +1080,17 @@ class CollectionResult:
         )
 
 
+def _invoker_variant(invoker: "CaptureInvoker") -> CaptureVariant:
+    """The variant an invoker will actually pass to the binary.
+
+    Read off the invoker rather than taken as a separate argument to ``run_collection`` so the two
+    can never disagree. A manifest that claims a variant the command line did not carry is worse
+    than no manifest field at all: it would make ``check_equivalence`` certify that a gate tested
+    something it did not.
+    """
+    return getattr(invoker, "variant", BASELINE_VARIANT)
+
+
 def run_collection(
     plans: Sequence[ShardPlan],
     *,
@@ -1065,6 +1161,10 @@ def run_collection(
                 spec_path=spec_path,
                 model_path=model_path,
                 out_dir=Path(scratch_root) / f"shard_{plan.shard_id:05d}",
+                # The dry run's whole value is that it shows the command line that WOULD run.
+                # Omitting the variant here would print a baseline invocation for a gate leg --
+                # the one thing a dry run exists to let you check before spending an hour on it.
+                variant=_invoker_variant(invoker),
             )
             result.dry_run_argv.append(argv)
             if verbose:
@@ -1217,7 +1317,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="plan the shards and print the argv without invoking anything",
     )
+    # Phase 3 variant legs (T3.7, T3.8). These change the numerics deliberately and are NOT in
+    # run_config_sha256 -- run.yaml does not carry them -- so they are recorded in every manifest
+    # via CaptureVariant, and src.analysis.precision.check_equivalence refuses to judge a gate
+    # whose two legs do not actually differ.
+    parser.add_argument("--variant-name", default="baseline")
+    parser.add_argument("--decode-mode", choices=("off", "full", "tail"), default="off",
+                        help="T3.8 candidate leg: single-token decode, or prefill-then-decode")
+    parser.add_argument("--decode-prefix", type=int, default=512)
+    parser.add_argument("--override-tensor", default=None,
+                        help=r"T3.7 candidate leg, e.g. 'blk\.\d+\.ffn_gate_inp\.weight=CPU'")
     args = parser.parse_args(argv)
+
+    try:
+        variant = CaptureVariant(
+            name=args.variant_name,
+            override_tensor=args.override_tensor,
+            decode_mode=args.decode_mode,
+            decode_prefix=args.decode_prefix,
+        )
+    except RunnerError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not variant.is_baseline and args.variant_name == "baseline":
+        print("--variant-name is still 'baseline' but the run carries variant flags. Name it, so "
+              "the manifest says what this leg was for.", file=sys.stderr)
+        return 2
 
     config = RunConfig.load(args.run_config)
     model_meta = load_model_meta(args.models, args.model)
@@ -1260,7 +1385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     outcome = run_collection(
         plans,
         config=config,
-        invoker=SubprocessInvoker(args.binary, timeout_s=args.timeout_s),
+        invoker=SubprocessInvoker(args.binary, timeout_s=args.timeout_s, variant=variant),
         backend=backend,
         ledger=ledger,
         spec_path=args.spec,

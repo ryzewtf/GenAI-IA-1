@@ -13,9 +13,10 @@ import numpy as np
 import pytest
 
 from src.analysis.precision import (
-    DEVICE_SPLIT_FLOOR,
+    EQUIVALENCE_FLOOR,
     PrecisionError,
     check_device_split,
+    check_equivalence,
     compare_traces,
     interpret,
     main,
@@ -75,7 +76,7 @@ def _logits_with_margins(margins):
 
 
 def make_pair(tmp_path, *, flips=None, margins=None, cand_quant="Q4_K_M", ref_quant="F16",
-              cand_overrides=None):
+              ref_overrides=None, cand_overrides=None):
     """Two traces of the same corpus differing only where ``flips`` says so.
 
     ``flips`` is a boolean ``(n_tokens, n_layers)`` array; a True entry replaces one selected
@@ -88,7 +89,7 @@ def make_pair(tmp_path, *, flips=None, margins=None, cand_quant="Q4_K_M", ref_qu
 
     ref_root = tmp_path / "ref"
     cand_root = tmp_path / "cand"
-    for root, quant, extra in ((ref_root, ref_quant, {}),
+    for root, quant, extra in ((ref_root, ref_quant, ref_overrides or {}),
                                (cand_root, cand_quant, cand_overrides or {})):
         make_synthetic_trace(
             root, spec=SPEC, shard_sizes=SHARDS, tokens_per_doc=10, hidden_every=4, seed=7,
@@ -339,11 +340,23 @@ def test_one_bad_layer_hidden_behind_a_good_mean_is_called_out(tmp_path):
 # -- T8.5 ------------------------------------------------------------------------------------
 
 
+def split_pair(tmp_path, **kwargs):
+    """A T8.5 pair: same everything except the pinned tensor split."""
+    return make_pair(
+        tmp_path,
+        ref_quant="Q4_K_M", cand_quant="Q4_K_M",
+        ref_overrides={"device_plan": {"n_gpu": 2, "tensor_split": [0.5, 0.5]}},
+        cand_overrides={"device_plan": {"n_gpu": 2, "tensor_split": [0.7, 0.3]}},
+        **kwargs,
+    )
+
+
 def test_device_split_passes_on_identical_traces(tmp_path):
-    result = check_device_split(compare_traces(*make_pair(tmp_path)))
+    result = check_device_split(compare_traces(*split_pair(tmp_path)))
     assert result.passed
-    assert result.floor == DEVICE_SPLIT_FLOOR
-    assert "appendix alongside T3.7" in result.verdict
+    assert result.floor == EQUIVALENCE_FLOOR
+    assert result.task == "T8.5"
+    assert "invisible to the routing" in result.verdict
 
 
 def test_device_split_is_judged_on_the_worst_layer_not_the_mean(tmp_path):
@@ -351,7 +364,7 @@ def test_device_split_is_judged_on_the_worst_layer_not_the_mean(tmp_path):
     mean dilutes it by sixteen, and T8.5's job is to notice it, not to average it away."""
     flips = np.zeros((N_TOKENS, SPEC.n_moe_layers), dtype=bool)
     flips[:5, 2] = True  # layer 2 only: 5% of rows, worst-layer agreement ~0.983
-    comparison = compare_traces(*make_pair(tmp_path, flips=flips))
+    comparison = compare_traces(*split_pair(tmp_path, flips=flips))
     assert comparison.mean_set_agreement > 0.99
 
     result = check_device_split(comparison)
@@ -359,6 +372,78 @@ def test_device_split_is_judged_on_the_worst_layer_not_the_mean(tmp_path):
     assert result.worst_layer == 2
     assert "split-dependent" in result.verdict
     assert "Qwen3 and Gemma 4" in result.verdict
+
+
+# -- the "nothing actually varied" guard ---------------------------------------------------------
+
+
+def test_a_gate_refuses_when_the_variable_never_changed(tmp_path):
+    """Every one of these gates scores a perfect 100% when the two legs are secretly identical —
+    an --override-tensor pattern that matched nothing, a flag the binary ignored, a second
+    collection that reused the first config. That is the worst failure a gate can have, because it
+    is indistinguishable from a pass."""
+    same = make_pair(
+        tmp_path, ref_quant="Q4_K_M", cand_quant="Q4_K_M",
+        ref_overrides={"device_plan": {"n_gpu": 2, "tensor_split": [0.5, 0.5]}},
+        cand_overrides={"device_plan": {"n_gpu": 2, "tensor_split": [0.5, 0.5]}},
+    )
+    comparison = compare_traces(*same)
+    assert comparison.mean_set_agreement == 1.0, "it would sail through on the number alone"
+    with pytest.raises(PrecisionError, match="never changed"):
+        check_device_split(comparison)
+
+
+def test_a_gate_says_so_when_the_variant_was_never_recorded(tmp_path):
+    """Absent is not the same as identical, and the remedy differs: one needs a re-collection, the
+    other needs an explicit override."""
+    comparison = compare_traces(*make_pair(tmp_path, ref_quant="Q4_K_M", cand_quant="Q4_K_M"))
+    with pytest.raises(PrecisionError, match="neither manifest records"):
+        check_equivalence(comparison, task="T3.8")
+    result = check_equivalence(comparison, task="T3.8", require_variation=False)
+    assert result.passed, "an explicit opt-out must still produce a verdict"
+
+
+def test_t3_7_reads_the_override_tensor_field(tmp_path):
+    reference, candidate = make_pair(
+        tmp_path, ref_quant="Q4_K_M", cand_quant="Q4_K_M",
+        ref_overrides={"capture_variant": {"name": "baseline", "override_tensor": None,
+                                           "decode_mode": "off"}},
+        cand_overrides={"capture_variant": {
+            "name": "router-cpu",
+            "override_tensor": "blk\\.\\d+\\.ffn_gate_inp\\.weight=CPU",
+            "decode_mode": "off"}},
+    )
+    result = check_equivalence(compare_traces(reference, candidate), task="T3.7")
+    assert result.passed
+    assert "router placement" in result.verdict
+
+
+def test_t3_8_failure_names_the_threat_to_the_papers_framing(tmp_path):
+    """T3.8 is not a footnote. Every result in the paper is a prefill measurement being read as a
+    claim about decode-time prefetching, so a failure changes what the study is entitled to say."""
+    flips = np.zeros((N_TOKENS, SPEC.n_moe_layers), dtype=bool)
+    flips[:30, 3] = True
+    reference, candidate = make_pair(
+        tmp_path, flips=flips, ref_quant="Q4_K_M", cand_quant="Q4_K_M",
+        ref_overrides={"capture_variant": {"decode_mode": "off"}},
+        cand_overrides={"capture_variant": {"decode_mode": "full"}},
+    )
+    result = check_equivalence(compare_traces(reference, candidate), task="T3.8")
+    assert not result.passed
+    assert result.task == "T3.8"
+    assert "prefetching" in result.verdict
+    assert "framing has to change" in result.verdict
+
+
+def test_an_unknown_task_is_refused_rather_than_defaulted(tmp_path):
+    comparison = compare_traces(*make_pair(tmp_path))
+    with pytest.raises(PrecisionError, match="unknown equivalence task"):
+        check_equivalence(comparison, task="T9.9", require_variation=False)
+
+
+def test_the_three_gates_share_one_floor():
+    from src.analysis.precision import DEVICE_SPLIT_FLOOR
+    assert DEVICE_SPLIT_FLOOR == EQUIVALENCE_FLOOR == 0.999
 
 
 # -- report and CLI ---------------------------------------------------------------------------
@@ -389,11 +474,23 @@ def test_cli_ladder_mode(tmp_path, capsys):
 def test_cli_device_split_mode_uses_the_t8_5_floor(tmp_path, capsys):
     flips = np.zeros((N_TOKENS, SPEC.n_moe_layers), dtype=bool)
     flips[:5, 2] = True
-    make_pair(tmp_path, flips=flips)
+    split_pair(tmp_path, flips=flips)
     rc = main(["--reference-root", str(tmp_path / "ref"), "--candidate-root", str(tmp_path / "cand"),
-               "--model", "synth-moe", "--corpus", "synth-v1", "--mode", "device-split"])
+               "--model", "synth-moe", "--corpus", "synth-v1", "--mode", "T8.5"])
     assert rc == 1
     assert "T8.5 FAIL" in capsys.readouterr().out
+
+
+def test_cli_runs_the_t3_8_gate(tmp_path, capsys):
+    make_pair(
+        tmp_path, ref_quant="Q4_K_M", cand_quant="Q4_K_M",
+        ref_overrides={"capture_variant": {"decode_mode": "off"}},
+        cand_overrides={"capture_variant": {"decode_mode": "full"}},
+    )
+    rc = main(["--reference-root", str(tmp_path / "ref"), "--candidate-root", str(tmp_path / "cand"),
+               "--model", "synth-moe", "--corpus", "synth-v1", "--mode", "T3.8"])
+    assert rc == 0
+    assert "T3.8 PASS" in capsys.readouterr().out
 
 
 def test_cli_reports_could_not_run_separately_from_drift(tmp_path, capsys):

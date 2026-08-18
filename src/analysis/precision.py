@@ -1,4 +1,20 @@
-"""Phase 8 — precision ladder drift metrics, the T8.3 interpretation gate, and T8.5.
+"""Two-trace equivalence and drift: Phase 8's precision ladder, plus the T3.7/T3.8 gates.
+
+Four tasks in the plan reduce to one operation — collect the same corpus twice with exactly one
+pinned variable changed, then compare the routing:
+
+===== ==================================== ============================ =========================
+Task   Variable                             Acceptance                   Judged on
+===== ==================================== ============================ =========================
+T3.7   router placement (GPU vs CPU)        >= 99.9% set agreement       worst layer
+T3.8   batching (prefill vs decode)         >= 99.9% set agreement       worst layer
+T8.2   quantization (F16 vs Q8_0/Q4_K_M)    a measured bound, not a pass  mean, banded by T8.3
+T8.5   tensor split (0.5/0.5 vs 0.7/0.3)    >= 99.9% set agreement       worst layer
+===== ==================================== ============================ =========================
+
+The three gates share :func:`check_equivalence`; T8.3 keeps its own banded reading because it is
+not asking pass/fail, it is quantifying a limitation. The split between "worst layer" and "mean" is
+deliberate and is the one place these tasks genuinely differ — see :func:`check_equivalence`.
 
 Phase 8 turns "quantization probably doesn't matter" into a measured bound. Every model in the
 panel except OLMoE is collected quantized because nothing else fits, so the size of the
@@ -6,8 +22,8 @@ quantization effect is a limitation the paper has to state either way; the only 
 whether it is stated as a number or as a hope.
 
 The comparison is between two traces of the **same model on the same corpus** that differ in one
-pinned variable — the quantization level for T8.1/T8.2/T8.4, the tensor split for T8.5. Everything
-here is that one comparison, plus the arithmetic that reads a decision off it.
+pinned variable. Everything here is that one comparison, plus the arithmetic that reads a decision
+off it.
 
 **What is compared, and why it is `topk.bin` on both sides.** Set agreement is computed from the
 model-emitted expert indices, never from a recomputation off the stored logits. `topk.bin` is what
@@ -26,11 +42,18 @@ stated prediction is precisely that drift scales with expert count, binning that
 count with margin scale would answer the question by construction. Quantile bins are computed
 per (layer, comparison) and are directly comparable across both.
 
-**Alignment is checked, not assumed.** Two traces of the same corpus under different quantizations
-must contain byte-identical ``tokens.bin`` token ids: the tokenizer does not depend on the weights.
-If they differ, one of the runs saw different text and every number below is meaningless, so it is
-a hard error rather than a low score. This is the Phase 8 counterpart of T3.2's segmentation check
-and it costs one array comparison.
+**Alignment is checked, not assumed.** Two traces of the same corpus must contain byte-identical
+``tokens.bin`` token ids: the tokenizer depends on neither the weights' quantization, the router's
+placement, nor the batching. If they differ, one of the runs saw different text and every number
+below is meaningless, so it is a hard error rather than a low score. This is the counterpart of
+T3.2's segmentation check and it costs one array comparison.
+
+**A comparison where nothing actually varied is refused.** Every one of these tasks scores 100% if
+the two legs are secretly identical — a `--override-tensor` pattern that matched no tensor, a
+`--decode-mode` flag the binary ignored, a second collection that reused the first's config. That
+is the worst failure mode a validation gate can have, because it is indistinguishable from a pass.
+:func:`check_equivalence` therefore takes the name of the field that was supposed to differ and
+refuses to return a verdict when it did not.
 """
 
 from __future__ import annotations
@@ -52,9 +75,13 @@ __all__ = [
     "LayerDrift",
     "LadderComparison",
     "InterpretationGate",
+    "EquivalenceResult",
     "DEFAULT_MARGIN_QUANTILES",
+    "EQUIVALENCE_FLOOR",
+    "EQUIVALENCE_TASKS",
     "compare_traces",
     "interpret",
+    "check_equivalence",
     "check_device_split",
     "main",
 ]
@@ -64,8 +91,42 @@ __all__ = [
 GATE_BOUNDED = 0.97
 GATE_SEVERE = 0.90
 
-#: Plan T8.5 acceptance for the device-split sensitivity check.
-DEVICE_SPLIT_FLOOR = 0.999
+#: Plan acceptance shared by T3.7, T3.8 and T8.5. All three ask the same question — "is this
+#: knob invisible to the routing?" — and the plan gives all three the same floor.
+EQUIVALENCE_FLOOR = 0.999
+DEVICE_SPLIT_FLOOR = EQUIVALENCE_FLOOR  # kept as the T8.5 spelling
+
+#: For each gate: the manifest field that MUST differ between the two legs, and what to say when a
+#: failure means. `varies` is not decoration -- it is the check that the experiment happened at all.
+EQUIVALENCE_TASKS: dict[str, dict[str, str]] = {
+    "T3.7": {
+        "varies": "override_tensor",
+        "label": "router placement (GPU-resident vs --override-tensor ...=CPU)",
+        "on_fail": (
+            "The router's device placement changes its own output. §0b assumes it does not, and "
+            "the collection config leaves the router on GPU on that basis. Report the measured "
+            "figure and pin the placement."
+        ),
+    },
+    "T3.8": {
+        "varies": "decode_mode",
+        "label": "batching (prefill vs decode)",
+        "on_fail": (
+            "Prefill routing is NOT decode routing. Every result in the paper is a prefill "
+            "measurement being read as a claim about decode-time prefetching, so this is a "
+            "validity threat to the central interpretation, not a footnote. §0b asserts this "
+            "equivalence; the assertion is wrong and the framing has to change."
+        ),
+    },
+    "T8.5": {
+        "varies": "tensor_split",
+        "label": "device split (0.5/0.5 vs 0.7/0.3)",
+        "on_fail": (
+            "Pair T results are split-dependent: every Qwen3 and Gemma 4 number must be collected "
+            "under one pinned split, and that fact stated prominently."
+        ),
+    },
+}
 
 #: Quantile edges for the margin conditioning. Five bins, weighted toward the small-margin end
 #: because that is where the interesting structure is: the top bin exists mainly to show that it
@@ -116,6 +177,11 @@ class LadderComparison:
     n_experts: int
     layers: list[LayerDrift] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: `capture_variant` from each side's manifest -- what was actually pinned differently. Empty
+    #: for a trace collected before the field existed, which check_equivalence treats as "unknown"
+    #: rather than "same": see its require_variation argument.
+    reference_variant: dict[str, Any] = field(default_factory=dict)
+    candidate_variant: dict[str, Any] = field(default_factory=dict)
 
     @property
     def mean_set_agreement(self) -> float:
@@ -153,6 +219,8 @@ class LadderComparison:
             "n_experts": self.n_experts,
             "mean_set_agreement": self.mean_set_agreement,
             "depth_trend_spearman": self.depth_trend(),
+            "reference_variant": self.reference_variant,
+            "candidate_variant": self.candidate_variant,
             "notes": self.notes,
             "layers": [asdict(l) for l in self.layers],
         }
@@ -253,6 +321,8 @@ def compare_traces(
         top_k=top_k,
         n_experts=reference.n_experts,
         notes=notes,
+        reference_variant=_variant_block(ref_m),
+        candidate_variant=_variant_block(cand_m),
     )
 
     windows = []
@@ -396,7 +466,9 @@ def interpret(comparison: LadderComparison) -> InterpretationGate:
 
 
 @dataclass(frozen=True)
-class DeviceSplitResult:
+class EquivalenceResult:
+    task: str
+    label: str
     passed: bool
     mean_set_agreement: float
     worst_layer: int
@@ -405,35 +477,109 @@ class DeviceSplitResult:
     verdict: str
 
     def to_json(self) -> dict[str, Any]:
-        return {"task": "T8.5", **asdict(self)}
+        return {"task": self.task, **asdict(self)}
 
 
-def check_device_split(
-    comparison: LadderComparison, *, floor: float = DEVICE_SPLIT_FLOOR
-) -> DeviceSplitResult:
-    """Apply plan T8.5's acceptance to a comparison of two tensor splits.
+#: Back-compatible alias: T8.5 was written first and named its result type after itself.
+DeviceSplitResult = EquivalenceResult
 
-    Judged on the **worst layer**, not the mean, and that is a deliberate departure from how T8.3
-    reads its bands. T8.5 is not measuring a quantity to report as a bound; it is asking whether
-    the split is a confound at all. One layer that lands on a different device and drifts is
-    exactly the failure mode, and a 16-layer mean dilutes it by sixteen.
+
+def _variant_block(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """The knobs a validation gate may legitimately vary, gathered from where each actually lives.
+
+    They are not in one place and pretending otherwise would be the bug: `override_tensor` and
+    `decode_mode` are capture-time flags outside `run_config_sha256` and live in `capture_variant`,
+    while `tensor_split` is a pinned `run.yaml` value the runner records under `device_plan`. A
+    resolver that looked in only one of them would silently read `None` for the other and conclude
+    "these legs are identical" about a comparison that varied exactly as intended.
     """
+    block = dict(manifest.get("capture_variant") or {})
+    device = manifest.get("device_plan") or {}
+    split = device.get("tensor_split")
+    block.setdefault("tensor_split", tuple(split) if isinstance(split, (list, tuple)) else split)
+    block.setdefault("quant", manifest.get("quant"))
+    return block
+
+
+def _variant_values(comparison: LadderComparison, field_name: str) -> tuple[Any, Any]:
+    return (comparison.reference_variant.get(field_name),
+            comparison.candidate_variant.get(field_name))
+
+
+def check_equivalence(
+    comparison: LadderComparison,
+    *,
+    task: str = "T8.5",
+    floor: float = EQUIVALENCE_FLOOR,
+    require_variation: bool = True,
+) -> EquivalenceResult:
+    """Apply a >= ``floor`` set-agreement gate to a two-leg comparison (T3.7, T3.8, T8.5).
+
+    **Judged on the worst layer, not the mean**, and that is a deliberate departure from how T8.3
+    reads its bands. These three are not measuring a quantity to report as a bound; they are asking
+    whether a knob is a confound at all. One layer that lands on a different device, or whose
+    kernel selection flips at batch size 1, is exactly the failure mode — and a 16-layer mean
+    dilutes it by sixteen, a 61-layer Qwen3 mean by sixty-one.
+
+    **A comparison where nothing varied is refused rather than passed.** Each of these gates scores
+    a perfect 100% when the two legs are secretly identical: a `--override-tensor` pattern that
+    matched nothing, a flag the binary silently ignored, a second collection that reused the first
+    config. `moe_trace` now refuses a no-op override at the source, but a gate that cannot tell
+    "invisible knob" from "knob never turned" is not a gate, so the manifests are checked too.
+    """
+    spec = EQUIVALENCE_TASKS.get(task)
+    if spec is None:
+        raise PrecisionError(f"unknown equivalence task {task!r}; have {sorted(EQUIVALENCE_TASKS)}")
+
     worst = comparison.worst
     if worst is None:
         raise PrecisionError("comparison has no layers")
+
+    if require_variation:
+        field_name = spec["varies"]
+        ref_value, cand_value = _variant_values(comparison, field_name)
+        if ref_value is None and cand_value is None:
+            raise PrecisionError(
+                f"{task}: neither manifest records {field_name}, so it cannot be confirmed that "
+                "the two legs differ at all — and this gate scores ~100% when they do not. "
+                "Re-collect through src.runtime.runner so the variant is recorded, or pass "
+                "require_variation=False if you have verified it some other way."
+            )
+        if ref_value == cand_value:
+            raise PrecisionError(
+                f"{task}: both legs report {field_name}={ref_value!r}, so the variable this gate "
+                f"exists to test was never changed. The comparison would score ~100% and the gate "
+                f"would pass without having measured anything. Check that the second leg was "
+                f"actually collected with a different {field_name}."
+            )
+
     passed = worst.set_agreement >= floor
-    verdict = (
-        f"PASS: worst layer {worst.layer} agrees at {worst.set_agreement:.6f} >= {floor}. "
-        "Report in the appendix alongside T3.7."
-        if passed else
-        f"FAIL: layer {worst.layer} agrees at only {worst.set_agreement:.6f} < {floor}. Pair T "
-        "results are split-dependent: every Qwen3 and Gemma 4 number must be collected under one "
-        "pinned split, and that fact stated prominently."
-    )
-    return DeviceSplitResult(
-        passed=passed, mean_set_agreement=comparison.mean_set_agreement, worst_layer=worst.layer,
+    if passed:
+        verdict = (
+            f"PASS: {spec['label']} is invisible to the routing — worst layer {worst.layer} agrees "
+            f"at {worst.set_agreement:.6f} >= {floor}. Report the measured figure in the methods "
+            "section; it upgrades an assumption into a verified claim."
+        )
+    else:
+        verdict = (
+            f"FAIL: {spec['label']} changes the routing — layer {worst.layer} agrees at only "
+            f"{worst.set_agreement:.6f} < {floor}. {spec['on_fail']}"
+        )
+
+    return EquivalenceResult(
+        task=task, label=spec["label"], passed=passed,
+        mean_set_agreement=comparison.mean_set_agreement, worst_layer=worst.layer,
         worst_set_agreement=worst.set_agreement, floor=floor, verdict=verdict,
     )
+
+
+def check_device_split(
+    comparison: LadderComparison, *, floor: float = EQUIVALENCE_FLOOR,
+    require_variation: bool = True,
+) -> EquivalenceResult:
+    """Plan T8.5 — the device-split spelling of :func:`check_equivalence`."""
+    return check_equivalence(comparison, task="T8.5", floor=floor,
+                             require_variation=require_variation)
 
 
 # -- CLI ---------------------------------------------------------------------------------------
@@ -452,9 +598,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--candidate-model", default=None,
                         help="if the candidate trace is filed under a different model key")
     parser.add_argument("--max-tokens", type=int, default=None)
-    parser.add_argument("--mode", choices=("ladder", "device-split"), default="ladder",
-                        help="ladder applies T8.3's bands; device-split applies T8.5's floor")
-    parser.add_argument("--floor", type=float, default=DEVICE_SPLIT_FLOOR)
+    parser.add_argument("--mode", choices=("ladder", "device-split", "T3.7", "T3.8", "T8.5"),
+                        default="ladder",
+                        help="ladder applies T8.3's banded reading; the task names apply that "
+                             "task's >=99.9%% floor on the worst layer")
+    parser.add_argument("--floor", type=float, default=EQUIVALENCE_FLOOR)
+    parser.add_argument("--allow-unvaried", action="store_true",
+                        help="skip the check that the two legs differ in the knob under test. Only "
+                             "for traces collected before capture_variant existed.")
     parser.add_argument("--report", type=Path, default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -470,10 +621,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     payload: dict[str, Any] = {"comparison": comparison.to_json()}
-    if args.mode == "device-split":
-        outcome = check_device_split(comparison, floor=args.floor)
-        payload["device_split"] = outcome.to_json()
-        print(f"T8.5 {outcome.verdict}")
+    if args.mode != "ladder":
+        task = "T8.5" if args.mode == "device-split" else args.mode
+        try:
+            outcome = check_equivalence(comparison, task=task, floor=args.floor,
+                                        require_variation=not args.allow_unvaried)
+        except PrecisionError as exc:
+            # Refusing to judge is "could not run" (exit 2), not a failed gate (exit 1). A caller
+            # scripting the three gates has to be able to tell "this knob is a confound" from
+            # "this comparison never tested the knob".
+            print(f"{task} COULD NOT RUN: {exc}")
+            return 2
+        payload["equivalence"] = outcome.to_json()
+        print(f"{task} {outcome.verdict}")
         passed = outcome.passed
     else:
         gate = interpret(comparison)
