@@ -8,11 +8,7 @@ scratch/
 models/
 corpora/*.jsonl
 
-# Upstream llama.cpp: source tree and prebuilt release binaries. Never vendored into this repo —
-# the pinned commit lives in run.yaml (build.llama_cpp_commit) and each session re-clones it.
-llama_cpp_pull/
-llama-b*-bin-*/
-cudart-llama-bin-*/
+
 
 # Build
 build/

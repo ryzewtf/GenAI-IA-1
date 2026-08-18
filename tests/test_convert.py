@@ -177,3 +177,51 @@ def test_a_rewrite_to_the_same_value_is_a_no_op(models_path):
     before = models_path.read_text(encoding="utf-8")
     assert set_model_fields(models_path, "recorded", {"router_dtype": "F32"}) == []
     assert models_path.read_text(encoding="utf-8") == before
+
+
+# -- locating the converter ------------------------------------------------------------------
+
+
+def _ctx(tmp_path, commit="7077abbe14c510cb829c93a1328c2815b5805ebd"):
+    from src.runtime.setup_kaggle import SetupContext
+
+    return SetupContext(
+        scratch=tmp_path, dry_run=False, jobs=1, cuda_arch="75",
+        llama_commit=commit, quant="Q4_K_M", models=(), hf_token_present=False,
+    )
+
+
+def test_the_session_checkout_is_preferred_over_the_vendor_dir(tmp_path):
+    """On Kaggle it is the only one that exists: `.vendor/llama_cpp_pull` is a gitlink with no
+    `.gitmodules`, so a fresh clone of this project leaves that directory EMPTY."""
+    from scripts.kaggle_convert import find_llama_tree
+
+    ctx = _ctx(tmp_path)
+    ctx.llama_dir.mkdir(parents=True)
+    (ctx.llama_dir / "convert_hf_to_gguf.py").write_text("", encoding="utf-8")
+    assert find_llama_tree(ctx) == ctx.llama_dir
+
+
+def test_an_empty_checkout_is_not_mistaken_for_a_usable_one(tmp_path):
+    from scripts.kaggle_convert import find_llama_tree
+
+    ctx = _ctx(tmp_path)
+    ctx.llama_dir.mkdir(parents=True)  # exists, but holds no converter
+    with pytest.raises(ConvertError, match="gitlink"):
+        find_llama_tree(ctx)
+
+
+def test_a_checkout_at_the_wrong_commit_is_a_stop(tmp_path, monkeypatch):
+    """A converter at another commit is another recipe -- the exact confound this script removes."""
+    import scripts.kaggle_convert as kc
+
+    ctx = _ctx(tmp_path)
+    ctx.llama_dir.mkdir(parents=True)
+    (ctx.llama_dir / "convert_hf_to_gguf.py").write_text("", encoding="utf-8")
+
+    class _Proc:
+        stdout = "deadbeef" * 5 + "\n"
+
+    monkeypatch.setattr(kc.subprocess, "run", lambda *a, **k: _Proc())
+    with pytest.raises(ConvertError, match="but configs/run.yaml pins"):
+        kc.find_llama_tree(ctx)
