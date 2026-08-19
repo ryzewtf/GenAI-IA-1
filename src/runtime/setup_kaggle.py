@@ -89,6 +89,14 @@ class SetupContext:
     quant: str
     models: tuple[str, ...]
     hf_token_present: bool
+    cuda: bool = True
+    """False for a CPU session -- conversion, quantization, corpus building.
+
+    Not cosmetic: a Kaggle CPU session has no nvcc at all, so `-DGGML_CUDA=ON` fails at configure
+    time rather than falling back. It also changes :attr:`build_dir`, because a CPU and a CUDA
+    build must not share one directory: CMake would reuse the cached CUDA settings and the second
+    configure would fail for reasons that have nothing to do with the command that was run.
+    """
 
     @property
     def llama_dir(self) -> Path:
@@ -96,7 +104,7 @@ class SetupContext:
 
     @property
     def build_dir(self) -> Path:
-        return self.scratch / "build" / f"sm{self.cuda_arch}"
+        return self.scratch / "build" / (f"sm{self.cuda_arch}" if self.cuda else "cpu")
 
     @property
     def models_dir(self) -> Path:
@@ -264,14 +272,30 @@ def step_llama(ctx: SetupContext) -> StepResult:
                       {"commit": target, "dir": str(ctx.llama_dir)}, time.perf_counter() - t0)
 
 
-def step_build(ctx: SetupContext) -> StepResult:
-    """Configure and build moe_trace for the pinned architecture."""
-    t0 = time.perf_counter()
-    binary = ctx.build_dir / "moe_trace"
+def built_target(ctx: SetupContext, target: str) -> Path | None:
+    """Where `target` landed, or None. moe_trace sits at the build root; upstream tools in bin/."""
+    for candidate in (ctx.build_dir / target, ctx.build_dir / f"{target}.exe",
+                      ctx.build_dir / "bin" / target, ctx.build_dir / "bin" / f"{target}.exe"):
+        if candidate.exists():
+            return candidate
+    return None
 
-    if binary.exists() or (ctx.build_dir / "moe_trace.exe").exists():
-        return StepResult("build", "skipped", f"{binary} exists", {"binary": str(binary)},
-                          time.perf_counter() - t0)
+
+def step_build(ctx: SetupContext, *, targets: Sequence[str] = ("moe_trace",)) -> StepResult:
+    """Configure and build the requested targets for the pinned architecture.
+
+    `targets` exists because a CPU session wants `llama-quantize` and nothing else: building
+    moe_trace there would spend minutes on a binary that cannot run without a GPU, and -- worse --
+    the old unconditional `--target moe_trace` meant llama-quantize was never built at all, so the
+    conversion script looked for a file the build had not been asked to produce.
+    """
+    t0 = time.perf_counter()
+    binary = ctx.build_dir / targets[0]
+
+    existing = {t: built_target(ctx, t) for t in targets}
+    if all(existing.values()):
+        return StepResult("build", "skipped", f"{sorted(targets)} present",
+                          {"binary": str(existing[targets[0]])}, time.perf_counter() - t0)
     if not ctx.llama_dir.joinpath("include", "llama.h").exists() and not ctx.dry_run:
         raise SetupError(f"no llama.cpp source at {ctx.llama_dir}; run the 'llama' step first")
 
@@ -282,8 +306,10 @@ def step_build(ctx: SetupContext) -> StepResult:
             *generator,
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DLLAMA_CPP_DIR={ctx.llama_dir}",
-            "-DGGML_CUDA=ON",
-            f"-DCMAKE_CUDA_ARCHITECTURES={ctx.cuda_arch}",
+            # A CPU session has no CUDA Toolkit, so ON is not a harmless over-request: ggml-cuda's
+            # CMakeLists raises "CUDA Toolkit not found" and configure stops.
+            *(["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={ctx.cuda_arch}"]
+              if ctx.cuda else ["-DGGML_CUDA=OFF"]),
             # Mandatory, see the module docstring: a native build breaks T3.6 across sessions.
             "-DGGML_NATIVE=OFF",
             "-DGGML_CUDA_F16=OFF",
@@ -294,8 +320,10 @@ def step_build(ctx: SetupContext) -> StepResult:
         ],
         dry_run=ctx.dry_run, timeout=1800,
     )
-    _run(["cmake", "--build", str(ctx.build_dir), "--target", "moe_trace",
-          "-j", str(ctx.jobs)], dry_run=ctx.dry_run, timeout=5400)
+    build_cmd = ["cmake", "--build", str(ctx.build_dir)]
+    for target in targets:
+        build_cmd += ["--target", target]
+    _run([*build_cmd, "-j", str(ctx.jobs)], dry_run=ctx.dry_run, timeout=5400)
 
     return StepResult("build", "dry-run" if ctx.dry_run else "ok", str(binary),
                       {"binary": str(binary), "cuda_arch": ctx.cuda_arch},

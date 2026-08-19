@@ -318,6 +318,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         quant=str(_load_yaml(MODELS_CONFIG)["defaults"]["quant"]),
         models=(args.model,),
         hf_token_present=bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")),
+        # --cpu is for a session preparing artifacts, not collecting: collection needs CUDA. This
+        # also moves build_dir to build/cpu, so a CPU build cannot poison a later CUDA one through
+        # a shared CMake cache.
+        cuda=not args.cpu,
     )
 
     free_gb = shutil.disk_usage(scratch.parent if scratch.parent.exists() else "/").free / 2**30
@@ -339,9 +343,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _say("\n== build (skipped)")
         else:
             _say("\n== build (this is the slow one)")
-            if args.cpu:
-                # Only for a CPU session used to prepare artifacts; collection needs CUDA.
-                os.environ["MOE_TRACE_FORCE_CPU"] = "1"
             result = step_build(ctx)
             _say(f"  -> {result.status}: {result.detail[:300]}")
             if result.failed:

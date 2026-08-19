@@ -85,6 +85,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.capture.nodescan import set_model_fields  # noqa: E402
 from src.runtime.setup_kaggle import (  # noqa: E402
     SetupContext,
+    built_target,
     SetupError,
     _load_yaml,
     _pick_scratch,
@@ -120,6 +121,52 @@ PANEL_ORDER = (
 
 class ConvertError(RuntimeError):
     """A conversion step failed. Always fatal: a half-converted GGUF is not a usable artifact."""
+
+
+def find_llama_tree(ctx: SetupContext) -> Path:
+    """The llama.cpp tree whose converter this run will use.
+
+    The session checkout wins over the vendored one whenever it exists. Both are supposed to be the
+    pinned commit, but only one of them is *verifiable* here -- ``step_llama`` fetched it by sha and
+    it still has its ``.git``, whereas the vendored copy is a plain directory whose provenance is
+    whatever the last person to update it made it. So the checkout is preferred and checked, and the
+    vendored tree is the fallback for a workstation run where no session checkout exists.
+
+    An existing-but-empty ``llama_dir`` is an error rather than a reason to fall back. In clones
+    made before the vendored tree was committed, ``.vendor/llama_cpp_pull`` was a gitlink with no
+    ``.gitmodules``, so quietly reaching for it is how a run ends up converting with a converter
+    nobody chose -- and a converter at another commit is another recipe, which is the exact confound
+    this script exists to remove.
+    """
+    session = ctx.llama_dir
+    if session.exists():
+        if not (session / "convert_hf_to_gguf.py").exists():
+            raise ConvertError(
+                f"{session} exists but holds no convert_hf_to_gguf.py. In a clone made before the "
+                "vendored tree was committed, .vendor/llama_cpp_pull is an empty gitlink; run the "
+                "'llama' step so the pinned commit is fetched into the session checkout."
+            )
+        proc = subprocess.run(["git", "-C", str(session), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=False)
+        head = (getattr(proc, "stdout", "") or "").strip()
+        # A tree that cannot answer (no .git, so no output) is accepted; a tree that ANSWERS with
+        # the wrong commit is not.
+        if head and head != ctx.llama_commit:
+            raise ConvertError(
+                f"{session} is at {head[:12]} but configs/run.yaml pins {ctx.llama_commit[:12]}. "
+                "Converting there would produce a GGUF this project cannot describe."
+            )
+        return session
+
+    vendored = REPO_ROOT / ".vendor" / "llama_cpp_pull"
+    if (vendored / "convert_hf_to_gguf.py").exists():
+        return vendored
+    raise ConvertError(
+        f"no llama.cpp tree with a converter: neither {session} nor {vendored}. In a clone made "
+        "before the vendored tree was committed the latter is an empty gitlink; run the 'llama' "
+        "step to fetch the pinned commit."
+    )
+
 
 
 def _say(message: str) -> None:
@@ -241,18 +288,13 @@ def download_source(plan: ConversionPlan, dest: Path) -> Path:
     return dest
 
 
-def convert_to_gguf(plan: ConversionPlan, source: Path | str, outfile: Path, *, remote: bool) -> Path:
+def convert_to_gguf(plan: ConversionPlan, source: Path | str, outfile: Path, *,
+                    llama_tree: Path, remote: bool) -> Path:
     """Run the pinned `convert_hf_to_gguf.py`. This is the step the whole script exists for."""
     if outfile.exists():
         _say(f"  {outfile.name} already converted ({outfile.stat().st_size / 2**30:.1f} GiB)")
         return outfile
-    converter = REPO_ROOT / ".vendor" / "llama_cpp_pull" / "convert_hf_to_gguf.py"
-    if not converter.exists():
-        raise ConvertError(
-            f"{converter} not found. The converter must come from the PINNED checkout, not from "
-            "pip's `gguf` package: a converter at a different commit is a different recipe, which "
-            "is the confound this script removes."
-        )
+    converter = llama_tree / "convert_hf_to_gguf.py"
     outfile.parent.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(converter), str(source),
            "--outfile", str(outfile), "--outtype", plan.outtype]
@@ -260,7 +302,9 @@ def convert_to_gguf(plan: ConversionPlan, source: Path | str, outfile: Path, *, 
         # Streams the safetensors straight from the Hub. Saves the source copy entirely (~57 GiB
         # for Qwen3) at the cost of needing the network for the whole conversion.
         cmd.append("--remote")
-    _run(cmd, what="convert_hf_to_gguf.py", cwd=REPO_ROOT / ".vendor" / "llama_cpp_pull")
+    # cwd is the tree itself: the converter does `from conversion import ...`, a sibling package,
+    # and `import gguf` from the gguf-py it inserts on sys.path relative to its own location.
+    _run(cmd, what="convert_hf_to_gguf.py", cwd=llama_tree)
     if not outfile.exists():
         raise ConvertError(f"converter reported success but {outfile} does not exist")
     return outfile
@@ -391,6 +435,7 @@ def convert_one(
     args: argparse.Namespace,
     *,
     quantize_binary: Path,
+    llama_tree: Path,
 ) -> ConversionRecord:
     meta = resolve_model(model_key)
     plan = plan_conversion(model_key, meta, outtype=args.outtype)
@@ -409,7 +454,8 @@ def convert_one(
         source = download_source(plan, source_dir)
 
     f16 = convert_to_gguf(
-        plan, source, gguf_dir / f"{model_key}-{plan.outtype.upper()}.gguf", remote=args.remote
+        plan, source, gguf_dir / f"{model_key}-{plan.outtype.upper()}.gguf",
+        llama_tree=llama_tree, remote=args.remote,
     )
 
     if args.prune and not args.remote and source_dir.exists():
@@ -518,6 +564,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         quant=str(_load_yaml(MODELS_CONFIG)["defaults"]["quant"]),
         models=tuple(keys),
         hf_token_present=bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")),
+        # This session quantizes; it never infers. A Kaggle CPU session has no nvcc at all, so
+        # asking for CUDA does not degrade gracefully -- it stops at configure time.
+        cuda=False,
     )
 
     _say(f"models  : {', '.join(keys)}")
@@ -538,19 +587,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             # CPU build: this session quantizes, it does not infer. A CUDA build here would cost
             # ten minutes and buy nothing -- llama-quantize is CPU-only.
-            _say("\n== build (CPU; llama-quantize needs no CUDA)")
-            os.environ["MOE_TRACE_FORCE_CPU"] = "1"
-            result = step_build(ctx)
+            _say("\n== build (CPU, llama-quantize only)")
+            # Only llama-quantize: moe_trace cannot run in a session with no GPU anyway, and
+            # building it would spend minutes of a 4-vCPU box on a binary nothing here invokes.
+            result = step_build(ctx, targets=("llama-quantize",))
             _say(f"  -> {result.status}: {result.detail[:300]}")
             if result.failed:
                 raise ConvertError(result.detail)
 
-        quantize_binary = next(
-            (p for p in (ctx.build_dir / "bin" / "llama-quantize",
-                         ctx.build_dir / "bin" / "llama-quantize.exe",
-                         ctx.build_dir / "llama-quantize") if p.exists()),
-            None,
-        )
+        quantize_binary = built_target(ctx, "llama-quantize")
         if quantize_binary is None:
             raise ConvertError(
                 f"llama-quantize not found under {ctx.build_dir}. It comes from LLAMA_BUILD_TOOLS, "
@@ -558,9 +603,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "default). A build tree that predates that flag needs deleting and rebuilding."
             )
 
+        llama_tree = find_llama_tree(ctx)
+        _say(f"\nconverter: {llama_tree / 'convert_hf_to_gguf.py'}")
+
         records: list[ConversionRecord] = []
         for key in keys:
-            records.append(convert_one(key, ctx, args, quantize_binary=quantize_binary))
+            records.append(convert_one(key, ctx, args, quantize_binary=quantize_binary,
+                                       llama_tree=llama_tree))
 
         if args.write:
             _say("\n== recording in configs/models.yaml")
