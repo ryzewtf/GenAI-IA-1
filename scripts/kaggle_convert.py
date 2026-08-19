@@ -262,21 +262,33 @@ def _run(cmd: Sequence[str], *, what: str, cwd: Path | None = None) -> None:
 
 
 def download_source(plan: ConversionPlan, dest: Path) -> Path:
-    """Fetch the safetensors repo. Idempotent: `hf download` skips files already present."""
+    """Fetch the safetensors repo. Idempotent: files already present are skipped."""
     if (dest / "config.json").exists():
         _say(f"  source already present: {dest}")
         return dest
     dest.mkdir(parents=True, exist_ok=True)
     _say(f"  downloading {plan.hf_repo} -> {dest}  ({_free_gb(dest):.0f} GiB free)")
-    # One --exclude followed by every pattern: the flag is nargs="*", so repeating it would keep
-    # only the last group and quietly re-enable the duplicate-format downloads this list exists to
-    # skip.
-    cmd = ["hf", "download", plan.hf_repo, "--local-dir", str(dest), "--exclude", *DOWNLOAD_EXCLUDE]
+    # The Python API rather than the `hf download` CLI. In current huggingface_hub the CLI's
+    # --exclude is a typer Option taking ONE value per occurrence, so `--exclude a b c` binds only
+    # `a` and reassigns `b c` to the positional `filenames` argument -- which turns the command
+    # into "download exactly these files", finds nothing matching, and exits 0 having written
+    # nothing. A silent no-op is the worst possible failure mode for a download step, and it is
+    # unreachable here: ignore_patterns is a list parameter that cannot be mis-split, and a repo
+    # that cannot be fetched raises instead of succeeding emptily.
     try:
-        _run(cmd, what=f"hf download {plan.hf_repo}")
-    except ConvertError as exc:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover - present wherever the `hf` CLI is
         raise ConvertError(
-            f"{exc}\nIf this was 401/403, the repo is gated and needs an accepted licence plus "
+            "huggingface_hub is not importable from this interpreter, so the panel cannot be "
+            "downloaded. Install it (`pip install huggingface_hub`) and re-run."
+        ) from exc
+    try:
+        snapshot_download(plan.hf_repo, local_dir=str(dest),
+                          ignore_patterns=list(DOWNLOAD_EXCLUDE))
+    except Exception as exc:
+        raise ConvertError(
+            f"downloading {plan.hf_repo} failed: {type(exc).__name__}: {exc}\n"
+            "If this was 401/403, the repo is gated and needs an accepted licence plus "
             "HF_TOKEN in the session. google/gemma-4-26B-A4B is the one gated repo in this panel; "
             "the others were checked and are open."
         ) from None
