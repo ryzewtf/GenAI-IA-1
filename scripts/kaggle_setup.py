@@ -61,6 +61,7 @@ from src.runtime.setup_kaggle import (  # noqa: E402
     SetupError,
     _load_yaml,
     _pick_scratch,
+    _read_patch_pins,
     step_build,
     step_deps,
     step_env,
@@ -346,6 +347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs=args.jobs,
         cuda_arch=str(build.get("cuda_architectures", "75")),
         llama_commit=str(commit),
+        # Without this the pinned patches never reach step_llama's _apply_patches, so Gemma 4 builds
+        # without its ffn_moe_router_input callback and T1.4 halts on anonymous node_NNNN names.
+        llama_patches=_read_patch_pins(build),
         quant=str(_load_yaml(MODELS_CONFIG)["defaults"]["quant"]),
         models=(args.model,),
         hf_token_present=bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")),

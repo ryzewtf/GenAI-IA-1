@@ -182,6 +182,26 @@ def test_step_llama_applies_patches_when_the_tree_is_already_at_the_commit(fake_
     assert "ffn_moe_router_input" in (fake_llama / TARGET).read_text(encoding="utf-8")
 
 
+def test_the_scripts_driver_wires_patches_into_the_setup_context():
+    """scripts/kaggle_setup.py builds its own SetupContext by hand -- separate from
+    src/runtime/setup_kaggle.main -- and originally omitted llama_patches, so every gates run built
+    Gemma 4 unpatched no matter the model order. Guard the wiring two ways: the shipped run.yaml
+    still carries a pin to pass through, and the driver still reads it into the context."""
+    import inspect
+
+    import yaml
+
+    import scripts.kaggle_setup as driver
+
+    build = yaml.safe_load((REPO_ROOT / "configs" / "run.yaml").read_text(
+        encoding="utf-8"))["hashed"]["build"]
+    assert _read_patch_pins(build), "run.yaml lost its patch pin; Gemma 4 would build unpatched"
+
+    src = inspect.getsource(driver.main)
+    assert "llama_patches=_read_patch_pins(build)" in src, (
+        "the driver stopped wiring patches into SetupContext; _apply_patches will see none")
+
+
 def test_gemma_router_input_points_at_the_patched_node():
     """models.yaml and the patch have to agree on the name, and nothing else in the panel may pick
     it up -- the other six architectures pass the router the same tensor they pass the experts."""
