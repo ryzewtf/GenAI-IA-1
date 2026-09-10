@@ -29,9 +29,25 @@ from src.corpus.build import (
     shard_table,
     write_corpus,
 )
-from src.corpus.spec import CorpusSpec, CorpusSpecError
+from src.corpus.spec import MIXED_V1, MIXED_V1_SCALE, CorpusSpec, CorpusSpecError
 
 COUNTER = CharRatioCounter()
+
+
+def test_shipped_specs_cap_docs_below_n_ctx_so_real_tokenization_cannot_overflow():
+    """I15 is zero-tolerance: a doc truncated at capture rejects the whole shard. The cap is counted
+    with the char-ratio proxy (4.0 chars/token) but capture uses each model's real tokenizer, which
+    fragments further on non-Latin/code -- a doc at 2048 reference tokens measured ~2668 real under
+    OLMoE. So the shared cap must sit BELOW the pinned n_ctx (2048) with margin, not at it. Pin that
+    here so it is not quietly raised back to n_ctx."""
+    N_CTX = 2048
+    for spec in (MIXED_V1, MIXED_V1_SCALE):
+        assert spec.max_doc_tokens <= 1280, spec.name
+        # The cap in chars is max_doc_tokens * 4.0 (the reference proxy). OLMoE's observed worst was
+        # ~3.07 real chars/token; check a stricter 2.7 (heavier fragmentation headroom) still lands
+        # under n_ctx real tokens. At 1280: 5120 chars / 2.7 ~= 1896 < 2048.
+        worst_real_tokens = (spec.max_doc_tokens * 4.0) / 2.7
+        assert worst_real_tokens < N_CTX, (spec.name, worst_real_tokens)
 
 # (domain, lang, n_docs, chars_per_doc) -- multilingual is split over languages so there are small
 # strata (hi with 4 docs) as well as large ones, which is where the rounding rule shows.

@@ -256,12 +256,23 @@ class CorpusSpec:
         return path
 
 
-MIXED_V1 = CorpusSpec(name="mixed-v1", target_tokens=1_000_000)
+# max_doc_tokens is 1280, deliberately below the pinned n_ctx of 2048, NOT equal to it. The cap is
+# enforced with the char-ratio reference counter (4.0 chars/token) so that one shared corpus can have
+# one shared token count across all seven checkpoints (T4.3). But real tokenizers fragment further
+# than 4 chars/token on the non-Latin (CulturaX) and symbol-dense (code/math) tail: a doc at 2048
+# reference tokens measured ~2668 real tokens under OLMoE (~3.07 real chars/token worst case), so it
+# was truncated at capture and I15 (zero-tolerance) rejected the shard. 1280 ref tokens = 5120 chars,
+# which stays under 2048 real tokens even at ~2.5 chars/token, giving margin for every panel
+# vocabulary. Lowering this is the ONLY correct lever: a real-tokenizer count cannot go into the
+# shared file without breaking T4.3's identical-shards requirement. Changing it requires a corpus
+# rebuild + republish.
+MIXED_V1 = CorpusSpec(name="mixed-v1", target_tokens=1_000_000, max_doc_tokens=1280)
 """The main corpus, all seven checkpoints. 500k if gate Q1 fires (T0.5)."""
 
 MIXED_V1_SCALE = CorpusSpec(
     name="mixed-v1-scale",
     target_tokens=4_000_000,
+    max_doc_tokens=1280,
     models=("olmoe-0125",),
     seed=1,
 )
