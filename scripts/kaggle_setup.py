@@ -314,6 +314,25 @@ def run_nodescan(model_key: str, gguf_path: Path, ctx: SetupContext, *, force: b
     return spec_path
 
 
+def _build_targets(*, cuda: bool, skip_gates: bool) -> tuple[str, ...]:
+    """The llama.cpp targets this session must build.
+
+    `cmake --build --target X` builds only X, so every tool a later step invokes has to be named
+    here or it silently will not exist -- a gap that only surfaces AFTER the slow, GPU-metered build
+    (it has cost a session twice: once on the CPU path, once on CUDA).
+
+      - moe_trace: the collector. Needs a GPU to run, so only a CUDA (collect/ladder) session builds
+        it -- a CPU session building it would burn minutes on a binary it cannot use.
+      - llama-eval-callback: the T1.4 node scan (run_nodescan), which runs whenever gates are NOT
+        skipped, on CPU AND CUDA sessions alike. So it is required on the CUDA path too unless
+        --skip-gates; omitting it there is what built moe_trace then failed T1.4 for want of it.
+      - llama-quantize: a CPU session may requantize during conversion.
+    """
+    if cuda:
+        return ("moe_trace",) if skip_gates else ("moe_trace", "llama-eval-callback")
+    return ("llama-eval-callback", "llama-quantize")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare a Kaggle session for one model")
     parser.add_argument("--model", required=True, help="model key in configs/models.yaml")
@@ -378,13 +397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _say("\n== build (skipped)")
         else:
             _say("\n== build (this is the slow one)")
-            # Build the targets this session type actually uses. A CPU (gates) session runs the
-            # T1.4 node scan (llama-eval-callback) and may requantize during conversion
-            # (llama-quantize); it must NOT build moe_trace, which needs a GPU to run and would
-            # only burn minutes. A CUDA (collect) session runs moe_trace. Building moe_trace
-            # unconditionally is why T1.4 could not find llama-eval-callback: the flag enables the
-            # target but `cmake --build --target moe_trace` never asks for it.
-            targets = ("moe_trace",) if ctx.cuda else ("llama-eval-callback", "llama-quantize")
+            targets = _build_targets(cuda=ctx.cuda, skip_gates=args.skip_gates)
             result = step_build(ctx, targets=targets)
             _say(f"  -> {result.status}: {result.detail[:300]}")
             if result.failed:
