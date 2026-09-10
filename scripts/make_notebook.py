@@ -175,6 +175,21 @@ run([sys.executable, "-m", "pip", "install", "-q", "--no-deps",
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # xet hangs at 0%%/99%% in managed notebooks
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+# The multilingual domain's parallel control (facebook/flores) and the code substitute
+# (starcoderdata) are gated on the HF Hub: without a token the corpus fetch dies with
+# DatasetNotFoundError partway through. The token lives in Kaggle Secrets, never inline --
+# an HF_TOKEN pasted into a cell is leaked the moment the notebook is saved. Both env names
+# are set because huggingface_hub reads HF_TOKEN and older datasets code reads the other.
+try:
+    from kaggle_secrets import UserSecretsClient
+    _hf = UserSecretsClient().get_secret("HF_TOKEN")
+    if _hf:
+        os.environ["HF_TOKEN"] = _hf
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = _hf
+        print("using HF_TOKEN from Kaggle Secrets")
+except Exception:
+    print("no HF_TOKEN secret; gated datasets (flores, starcoderdata) will 404 in a corpus run")
 ''' % {"git_url": GIT_URL}
 
 AUDIT_SRC = '''# ============================================================================
