@@ -374,7 +374,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             _say("\n== build (skipped)")
         else:
             _say("\n== build (this is the slow one)")
-            result = step_build(ctx)
+            # Build the targets this session type actually uses. A CPU (gates) session runs the
+            # T1.4 node scan (llama-eval-callback) and may requantize during conversion
+            # (llama-quantize); it must NOT build moe_trace, which needs a GPU to run and would
+            # only burn minutes. A CUDA (collect) session runs moe_trace. Building moe_trace
+            # unconditionally is why T1.4 could not find llama-eval-callback: the flag enables the
+            # target but `cmake --build --target moe_trace` never asks for it.
+            targets = ("moe_trace",) if ctx.cuda else ("llama-eval-callback", "llama-quantize")
+            result = step_build(ctx, targets=targets)
             _say(f"  -> {result.status}: {result.detail[:300]}")
             if result.failed:
                 raise SetupError(result.detail)

@@ -33,7 +33,8 @@ venv/
 .env
 kaggle.json
 hf_token*
-
+*.json
+*.jsonl
 # OS
 Thumbs.db
 .DS_Store

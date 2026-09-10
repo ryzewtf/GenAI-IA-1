@@ -57,7 +57,7 @@ a run that will not finish inside the 12 h cap.
 | `STAGE` | Accelerator | Internet | Attach | Roughly |
 |---|---|---|---|---|
 | `audit` | None | On | — | 2 min |
-| `gates` | None | On | the model's variation (optional) | 20–60 min |
+| `gates` | None | On | the model's variation (optional) | 20–60 min/model |
 | `corpus` | None | **On** | — | 1–3 h |
 | `collect` | **GPU T4 ×2** | On | the model's variation (recommended) | up to 12 h |
 | `ladder` | **GPU T4 ×2** | On | `olmoe-0125-f16` | 2–4 h |
@@ -71,6 +71,11 @@ actually wants. A per-session re-download is a trace whose weights can change un
 The panel is private, so a session without credentials sees these models as **missing**, not as
 forbidden. If a download 404s, check the token before concluding the model is gone.
 
+**Gating the whole panel at once.** For `STAGE='gates'`, set `MODEL='all'` to gate every model in
+`models.yaml` in one CPU session (or `MODEL='a,b'` for a chosen few). One model failing does not
+abort the run -- the rest still gate and the harvest patch carries home every spec that passed;
+the session exits non-zero so a failure is not missed. `collect`/`ladder` still take one model.
+
 **Nothing is committed or pushed from here.** The last cell writes a git patch to
 `/kaggle/working`; download it, `git apply` it on the workstation, and commit there.
 """
@@ -80,7 +85,11 @@ PARAMS_SRC = '''# ==============================================================
 # ============================================================================
 
 STAGE = "gates"        # audit | gates | corpus | collect | ladder
-MODEL = "olmoe-0125"   # model key in configs/models.yaml; ignored by audit/corpus
+# model key in configs/models.yaml; ignored by audit/corpus. For STAGE='gates' this may also be
+# "all" (every model in models.yaml) or a comma list ("gpt-oss-20b,qwen3-30b-a3b") to gate the
+# whole panel in one CPU session. collect/ladder require exactly one key -- batching GPU
+# collection is a heavier decision and those stages' guards assume a single model.
+MODEL = "all"
 
 # --- repo -------------------------------------------------------------------
 # A branch name tracks; a commit SHA pins. Pin for anything whose output goes in
@@ -224,7 +233,36 @@ if STAGE == "audit":
 elif STAGE == "gates":
     # CPU build on purpose: llama-eval-callback runs at -ngl 0 -c 512, so a GPU session here
     # spends an accelerator slot on a workload that never touches the GPU.
-    setup(MODEL, cpu=True)
+    #
+    # One session can gate the whole panel: MODEL="all" resolves to every key in models.yaml
+    # (read at runtime so the list cannot drift from the config), MODEL="a,b" to a chosen few.
+    if MODEL == "all":
+        import yaml
+        with open("configs/models.yaml", encoding="utf-8") as fh:
+            models = list(yaml.safe_load(fh)["models"].keys())
+    else:
+        models = [m.strip() for m in MODEL.split(",") if m.strip()]
+
+    # Do NOT abort the whole session on one model's failure. A 7-model CPU run is an hour-plus;
+    # a single bad model must not discard the gates that already passed. Collect failures, keep
+    # going, and re-raise at the end so the session still exits non-zero and the harvest patch
+    # still carries home every spec that did pass.
+    failures = {}
+    for i, m in enumerate(models, 1):
+        print(f"\\n{'=' * 78}\\n[{i}/{len(models)}] gating {m}\\n{'=' * 78}", flush=True)
+        try:
+            setup(m, cpu=True)
+        except SystemExit as exc:
+            print(f"  !! {m} FAILED: {exc}", flush=True)
+            failures[m] = str(exc)
+
+    print(f"\\n{'=' * 78}\\ngates summary: {len(models) - len(failures)}/{len(models)} passed",
+          flush=True)
+    if failures:
+        for m, why in failures.items():
+            print(f"  FAILED {m}: {why}", flush=True)
+        raise SystemExit(f"{len(failures)} model(s) failed gating: {sorted(failures)}. The specs "
+                         "for the models that passed are still in the harvest patch.")
 
 elif STAGE == "corpus":
     cmd = [sys.executable, "-m", "src.corpus.fetch", "--spec", CORPUS_SPEC]
@@ -282,7 +320,9 @@ HARVEST_SRC = '''# =============================================================
 # provenance intact, applies cleanly on the workstation, and -- unlike a push -- needs no token
 # and leaves the commit to the user.
 OUT = Path("/kaggle/working")
-tag = f"{STAGE}-{MODEL}" if STAGE in ("gates", "collect", "ladder") else STAGE
+# MODEL may be "all" or a comma list for a gates session; keep the tag a clean filename.
+_model_tag = "all" if ("," in MODEL or MODEL == "all") else MODEL
+tag = f"{STAGE}-{_model_tag}" if STAGE in ("gates", "collect", "ladder") else STAGE
 
 run(["git", "add", "-AN", "."], cwd=REPO, check=False)   # include new files in the diff
 # --full-index so `git apply --3way` can find the base blobs by unabbreviated sha; --binary so a
