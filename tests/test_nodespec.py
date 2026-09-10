@@ -158,14 +158,27 @@ def test_layer_map_length_must_match_n_moe_layers():
 # -- build_spec: T1.4 as a halt gate --------------------------------------------------------------------
 
 
+def _unverified(models):
+    """A model block with node_names reset to null -- what any model looks like before T1.4 runs.
+
+    Built synthetically rather than by naming a live-config model: the whole panel is now gated, so
+    no real entry is unverified any more, and a test that picked one would break the moment gates
+    completed (it did). This keeps testing the halt-gate behaviour without that coupling.
+    """
+    cfg = dict(models["models"]["olmoe-0125"])
+    cfg["node_names"] = {"logits": None, "logits_biased": None, "topk": None, "router_input": None}
+    cfg["logit_tensor_used"] = None
+    return {"models": {"olmoe-0125": cfg}}
+
+
 def test_unverified_node_names_are_refused_by_default(models):
     """T1.4 is a HALT GATE. Guessing node names is exactly what it exists to prevent."""
     with pytest.raises(NodeSpecError, match="HALT GATE"):
-        build_spec("olmoe-0125", models)
+        build_spec("olmoe-0125", _unverified(models))
 
 
 def test_assume_defaults_produces_an_explicitly_unverified_spec(models):
-    spec = build_spec("olmoe-0125", models, assume_defaults=True)
+    spec = build_spec("olmoe-0125", _unverified(models), assume_defaults=True)
     assert spec.verified is False
     assert spec.node_topk == DEFAULT_NODE_TEMPLATES["topk"]
     assert spec.node_router_input == DEFAULT_NODE_TEMPLATES["router_input"]
@@ -196,12 +209,16 @@ def test_a_declared_name_beats_the_default_field_by_field(models):
         "a spec that mixes declared and predicted names must say which is which")
 
 
-def test_the_gemma_hypothesis_names_the_patched_router_node(models):
+def test_the_gemma_spec_names_the_patched_router_node(models):
     """End to end on the real config: the patch, models.yaml and the generated spec must agree, or
-    the capture looks for a node the binary does not emit."""
+    the capture looks for a node the binary does not emit. T1.4 has now CONFIRMED all three names
+    (commit 7077abbe14c5 + gemma4-router-input-cb.patch), so the block is verified, not a
+    hypothesis -- but the router node it resolves to is still the patched callback tensor."""
     spec = build_spec("gemma-4-26b-a4b", models, assume_defaults=True)
     assert spec.node_router_input == "ffn_moe_router_input-%d"
-    assert spec.verified is False
+    assert spec.node_logits == "ffn_moe_probs-%d"
+    assert spec.node_topk == "ffn_moe_topk-%d"
+    assert spec.verified is True
 
 
 def test_hypothesis_spec_uses_the_predicted_selection_node(models):
@@ -309,4 +326,8 @@ def test_cli_writes_one_spec_per_model(tmp_path, capsys):
     assert rc == 0
     written = sorted(p.stem for p in tmp_path.glob("*.spec"))
     assert written == sorted(yaml.safe_load(MODELS_YAML.read_text(encoding="utf-8"))["models"])
-    assert "UNVERIFIED" in capsys.readouterr().out
+    # The panel is fully gated now, so every spec renders `verified`. (The UNVERIFIED banner that
+    # --assume-defaults prints for a not-yet-scanned model is covered directly by
+    # test_assume_defaults_produces_an_explicitly_unverified_spec, without coupling to live config.)
+    out = capsys.readouterr().out
+    assert out.count(".spec") == len(written)

@@ -397,11 +397,23 @@ def _models_copy(tmp_path):
     return dst
 
 
+def _reset_node_names(path, model_key):
+    """Null a model's node_names in the copied file. The real panel is fully gated now, so a test
+    of the null -> filled path has to create the null state rather than borrow it from live config."""
+    from src.capture.nodescan import set_model_fields
+
+    set_model_fields(path, model_key,
+                     {"node_names": "{logits: null, logits_biased: null, topk: null, "
+                                    "router_input: null}",
+                      "logit_tensor_used": "null"}, force=True)
+
+
 def test_write_back_fills_an_unset_model(tmp_path):
     import yaml
     from src.capture.nodescan import write_back
 
     path = _models_copy(tmp_path)
+    _reset_node_names(path, "qwen3-30b-a3b")
     changes = write_back(path, "qwen3-30b-a3b", _Report())
     assert len(changes) == 2
 
@@ -414,7 +426,8 @@ def test_write_back_is_idempotent(tmp_path):
     from src.capture.nodescan import write_back
 
     path = _models_copy(tmp_path)
-    write_back(path, "qwen3-30b-a3b", _Report())
+    _reset_node_names(path, "qwen3-30b-a3b")
+    assert write_back(path, "qwen3-30b-a3b", _Report()) != []
     assert write_back(path, "qwen3-30b-a3b", _Report()) == []
 
 

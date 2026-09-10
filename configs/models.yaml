@@ -57,8 +57,8 @@ models:
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0125, file: olmoe-0125-Q4_K_M.gguf, sha256: 57c420a91615c999acec2ae527244fb43aac04029a4daabda8bd5c85b5e9e10b, size_bytes: 4213512320}
     router_dtype: F32
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}  # T1.4
-    logit_tensor_used: null             # T1.4
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
+    logit_tensor_used: ffn_moe_probs
 
   olmoe-0125-instruct:
     hf_repo: allenai/OLMoE-1B-7B-0125-Instruct
@@ -147,8 +147,8 @@ models:
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0924, file: olmoe-0924-Q4_K_M.gguf, sha256: 9243992f6c421591a027b8740f835318017fb29dbcbb56e435d322c79f238622, size_bytes: 4213512064}
     router_dtype: F32
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
-    logit_tensor_used: null
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
+    logit_tensor_used: ffn_moe_probs
     drop_order: 1                        # first cut if quota binds
 
   gpt-oss-20b:
@@ -185,8 +185,8 @@ models:
     # exempts this checkpoint from the precision ladder — there is no uncompressed reference to
     # ladder against — but that is a property of the release, not of anything we did to it.
     router_dtype: F32
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
-    logit_tensor_used: null
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: attn_post_norm-%d}
+    logit_tensor_used: ffn_moe_probs
     notes: >
       transformers MXFP4 gates at compute capability >= (7,5); a T4 is exactly (7,5), so the
       T3.2 cross-validation is an open empirical question, not a known blocker. Needs Triton
@@ -225,8 +225,8 @@ models:
     # up there first. That check is still worth running: it now tests our converter rather than
     # someone else's, which is the version of the question that matters.
     router_dtype: F32
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
-    logit_tensor_used: null
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
+    logit_tensor_used: ffn_moe_probs
 
   qwen3-30b-a3b:
     hf_repo: Qwen/Qwen3-30B-A3B
@@ -247,8 +247,8 @@ models:
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/qwen3-30b-a3b, file: qwen3-30b-a3b-Q4_K_M.gguf, sha256: 2f0058c30d5ffb4df32e0f4db41d213c5c4e5dcd580f7e24fa9e4f54daadaeaa, size_bytes: 18556686432}
     router_dtype: F32
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
-    logit_tensor_used: null
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
+    logit_tensor_used: ffn_moe_probs
     notes: >
       Largest logit trace in the panel: 128 experts x 48 layers x 2 B = 12 KB/token -> ~12 GB at
       1M tokens. This alone justifies the chunked memmap reader (T6.1) regardless of RAM.
@@ -380,11 +380,12 @@ models:
     # configs/run.yaml:build.llama_cpp_patches. A session built without that patch will not find
     # this node, which is the intended behaviour: failing to resolve a name is loud, and capturing
     # `ffn_norm_2` instead would be silent and wrong.
-    # STILL UNVERIFIED: these are the names to CONFIRM with llama-eval-callback in a T1.4 gates
-    # session, not a confirmed result. logits/topk stay null until that run.
-    node_names: {logits: null, logits_biased: null, topk: null,
+    # VERIFIED by T1.4 (llama-eval-callback, commit 7077abbe14c5 + gemma4-router-input-cb.patch):
+    # the scan CONFIRMED all three node names consistent across every one of the 30 MoE layers,
+    # with router_input resolving to the patched callback tensor as intended.
+    node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d,
                  router_input: ffn_moe_router_input-%d}
-    logit_tensor_used: null
+    logit_tensor_used: ffn_moe_probs
 
 # --- comparison structure (§1.5) ---------------------------------------------------------------
 # None of these is a strictly controlled pair except Pair A. The framing matters in the write-up.
