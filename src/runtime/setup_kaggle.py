@@ -294,8 +294,16 @@ def step_llama(ctx: SetupContext) -> StepResult:
                               capture_output=True, text=True, check=False)
         head = proc.stdout.strip()
         if head == target:
-            return StepResult("llama", "skipped", f"already at {head[:12]}",
-                              {"commit": head}, time.perf_counter() - t0)
+            # The tree is at the right commit, but that says nothing about patches: a prior model
+            # in the same session with no patches of its own left HEAD here without applying this
+            # model's. _apply_patches is idempotent (it reverse-checks before applying), so run it
+            # on this path too rather than returning a tree that is the commit minus the patch.
+            applied = _apply_patches(ctx)
+            detail = f"already at {head[:12]}"
+            if applied:
+                detail += f" +{len(applied)} patch(es)"
+            return StepResult("llama", "skipped", detail,
+                              {"commit": head, "patches": applied}, time.perf_counter() - t0)
         # Re-point rather than re-clone: the fetch is the expensive part.
         _run(["git", "fetch", "--depth", "1", "origin", target], cwd=ctx.llama_dir,
              dry_run=ctx.dry_run)

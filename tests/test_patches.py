@@ -24,6 +24,7 @@ from src.runtime.setup_kaggle import (
     SetupError,
     _apply_patches,
     _read_patch_pins,
+    step_llama,
 )
 
 PATCH_REL = "patches/gemma4-router-input-cb.patch"
@@ -158,6 +159,27 @@ def test_a_pin_without_a_hash_is_rejected():
 def test_absent_patches_key_means_none():
     assert _read_patch_pins({}) == ()
     assert _read_patch_pins({"llama_cpp_patches": None}) == ()
+
+
+def test_step_llama_applies_patches_when_the_tree_is_already_at_the_commit(fake_llama, tmp_path):
+    """The multi-model regression: a prior model with no patches of its own leaves the tree at the
+    pinned commit, so the next model hits the "already at commit" branch. That branch used to return
+    before applying patches, so Gemma built without its router-input callback and T1.4 halted. The
+    skip path must apply patches too -- it is idempotent, so this is safe."""
+    # step_llama looks for scratch/llama.cpp; the fake_llama fixture already lives at
+    # tmp_path/llama.cpp, so scratch=tmp_path makes ctx.llama_dir resolve to it directly.
+    assert fake_llama == tmp_path / "llama.cpp"
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=fake_llama,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    ctx = SetupContext(
+        scratch=tmp_path, dry_run=False, jobs=1, cuda_arch="75",
+        llama_commit=head, llama_patches=((PATCH_REL, _sha(PATCH_PATH)),), quant="Q4_K_M",
+        models=(), hf_token_present=False,
+    )
+    result = step_llama(ctx)
+    assert result.status == "skipped"
+    assert [r["status"] for r in result.data["patches"]] == ["applied"]
+    assert "ffn_moe_router_input" in (fake_llama / TARGET).read_text(encoding="utf-8")
 
 
 def test_gemma_router_input_points_at_the_patched_node():
