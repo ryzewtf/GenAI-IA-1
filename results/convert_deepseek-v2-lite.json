@@ -1,0 +1,26 @@
+{
+  "model": "deepseek-v2-lite",
+  "hf_repo": "deepseek-ai/DeepSeek-V2-Lite",
+  "outtype": "f16",
+  "quantize_to": "Q4_K_M",
+  "recipe_reason": "panel recipe: f16 intermediate -> Q4_K_M",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "converter": "convert_hf_to_gguf.py",
+  "converter_env": {
+    "executable": "D:\\moe\\convert-venv\\Scripts\\python.exe",
+    "python": "3.11.15",
+    "transformers": "4.57.6",
+    "torch": "2.11.0+cpu",
+    "gguf": "0.19.0",
+    "numpy": "1.26.4",
+    "sentencepiece": "0.2.2"
+  },
+  "file": "deepseek-v2-lite-Q4_K_M.gguf",
+  "path": "D:\\moe\\gguf\\deepseek-v2-lite-Q4_K_M.gguf",
+  "size_bytes": 10367958016,
+  "sha256": "967ab33ee0d61ebe38bd974fdc31e4c9a4eea13fd9c72bcec43d7afc9f2bbef1",
+  "f16_path": null,
+  "f16_sha256": null,
+  "elapsed_s": 3635.7,
+  "notes": []
+}

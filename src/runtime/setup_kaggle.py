@@ -16,6 +16,12 @@ Design rules, each of which is a lesson the plan already paid for:
   inside `run_config_sha256`, and it is load-bearing for CORRECTNESS, not just reproducibility:
   `ffn_moe_topk` is a strided view under `ggml_argsort_top_k` and a contiguous op under the older
   `ggml_top_k`. This script refuses to build a different commit rather than "helpfully" taking HEAD.
+* **Patches are pinned the same way the commit is.** `build.llama_cpp_patches` names the patch
+  files applied on top of the pinned tree, each with the sha256 of its own bytes, and the whole
+  block is inside `run_config_sha256`. A patch is a change to the code that produces the numbers,
+  so a tree that is "the pinned commit plus something" is not the pinned commit and must not hash
+  as though it were. Applying is verified, idempotent, and refuses on any surprise: a patch that
+  neither applies nor is already applied stops the run rather than building an unknown tree.
 * **`GGML_NATIVE=OFF` is mandatory.** Kaggle does not guarantee the same host CPU between sessions,
   and a `-march=native` binary that selects different SIMD paths across sessions breaks T3.6's
   cross-session byte-identity gate. The step refuses to proceed if asked to turn it on.
@@ -28,6 +34,7 @@ Design rules, each of which is a lesson the plan already paid for:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -89,6 +96,15 @@ class SetupContext:
     quant: str
     models: tuple[str, ...]
     hf_token_present: bool
+    #: ``(path_relative_to_repo_root, sha256)`` per patch, in application order. Order is part of
+    #: the definition: two patches touching one file do not commute.
+    #:
+    #: Defaults to empty because that is what an absent `build.llama_cpp_patches` means, and
+    #: `_read_patch_pins` reads it the same way -- the two must agree or a config without the key
+    #: would behave differently depending on which path constructed the context. What guards
+    #: against an accidentally-unpatched build is the pin in run.yaml and `_apply_patches`
+    #: refusing anything it cannot verify, not the absence of a default here.
+    llama_patches: tuple[tuple[str, str], ...] = ()
     cuda: bool = True
     """False for a CPU session -- conversion, quantization, corpus building.
 
@@ -168,6 +184,25 @@ def _pick_scratch() -> Path:
     return Path(os.environ.get("TEMP", "/tmp")) / "moe"
 
 
+def _read_patch_pins(build: dict) -> tuple[tuple[str, str], ...]:
+    """Read `build.llama_cpp_patches` as an ordered list of (path, sha256).
+
+    Absent means none, which is the correct reading for every model but Gemma 4. A malformed entry
+    is an error rather than a skip: silently ignoring a patch entry is exactly the failure this
+    whole mechanism exists to prevent.
+    """
+    entries = build.get("llama_cpp_patches") or []
+    pins: list[tuple[str, str]] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or "file" not in entry or "sha256" not in entry:
+            raise SetupError(
+                f"build.llama_cpp_patches[{i}] must be a mapping with `file` and `sha256`; got "
+                f"{entry!r}. The hash is not optional -- it is what puts the patch inside "
+                "run_config_sha256.")
+        pins.append((str(entry["file"]), str(entry["sha256"])))
+    return tuple(pins)
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
         import yaml
@@ -199,15 +234,23 @@ def step_env(ctx: SetupContext) -> StepResult:
     # A capability mismatch against the pinned cuda_arch is not a warning. platform.gpu_arch is
     # inside run_config_sha256 (I3), so building for the wrong arch produces shards that must never
     # be merged with the rest -- and nothing downstream would notice.
-    if caps and ctx.cuda_arch not in caps:
-        raise SetupError(
-            f"pinned cuda_architectures={ctx.cuda_arch} but this session's GPU(s) report {caps}. "
-            "Either switch the accelerator or change configs/run.yaml deliberately -- "
-            "platform.gpu_arch is inside run_config_sha256 (invariant I3), so a mismatch makes "
-            "these shards a different experiment."
-        )
-    if len(caps) > 1:
-        raise SetupError(f"mixed GPU architectures {caps}; kernel selection differs per arch")
+    #
+    # Both checks are about what this session will COLLECT, so ctx.cuda gates them: a conversion or
+    # corpus session compiles no kernels and emits no shards, and whatever GPU happens to be in the
+    # workstation is not a fact about the experiment. Refusing there would only teach the operator
+    # to edit the pin, which is the one thing I3 exists to prevent.
+    if ctx.cuda:
+        if caps and ctx.cuda_arch not in caps:
+            raise SetupError(
+                f"pinned cuda_architectures={ctx.cuda_arch} but this session's GPU(s) report "
+                f"{caps}. Either switch the accelerator or change configs/run.yaml deliberately -- "
+                "platform.gpu_arch is inside run_config_sha256 (invariant I3), so a mismatch makes "
+                "these shards a different experiment."
+            )
+        if len(caps) > 1:
+            raise SetupError(f"mixed GPU architectures {caps}; kernel selection differs per arch")
+    elif caps and ctx.cuda_arch not in caps:
+        detail.append(f"CPU session; ignoring sm_{ctx.cuda_arch} pin vs local {caps}")
 
     free_gb = shutil.disk_usage(ctx.scratch.parent if ctx.scratch.parent.exists() else "/").free / 2**30
     detail.append(f"{free_gb:.1f} GiB free on scratch")
@@ -268,8 +311,77 @@ def step_llama(ctx: SetupContext) -> StepResult:
              dry_run=ctx.dry_run, timeout=1800)
         _run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=ctx.llama_dir, dry_run=ctx.dry_run)
 
-    return StepResult("llama", "dry-run" if ctx.dry_run else "ok", f"at {target[:12]}",
-                      {"commit": target, "dir": str(ctx.llama_dir)}, time.perf_counter() - t0)
+    applied = _apply_patches(ctx)
+
+    detail = f"at {target[:12]}"
+    if applied:
+        detail += f" +{len(applied)} patch(es)"
+    return StepResult("llama", "dry-run" if ctx.dry_run else "ok", detail,
+                      {"commit": target, "dir": str(ctx.llama_dir), "patches": applied},
+                      time.perf_counter() - t0)
+
+
+def _apply_patches(ctx: SetupContext) -> list[dict[str, str]]:
+    """Apply `build.llama_cpp_patches` to the checked-out tree, verifying each one first.
+
+    Three properties, each of which is a way this could go wrong quietly:
+
+    * **The patch bytes are checked against the sha256 in run.yaml before anything is applied.**
+      That sha is inside `run_config_sha256`, so an edited patch file changes the run config hash
+      and every manifest written afterwards says so. Without the check, editing the patch would
+      change the binary while the recorded hash kept insisting nothing had moved.
+    * **Idempotent, because `step_llama` is.** A re-run after a killed session re-enters here with
+      the patch already applied. `git apply --reverse --check` succeeding is the reliable test for
+      that, and it is checked BEFORE attempting to apply, so the normal resume path is a skip
+      rather than a failure that has to be interpreted.
+    * **A patch that neither applies nor is already applied is fatal.** The tempting fallback is to
+      warn and build anyway; that produces a binary that is missing a capture node, and the first
+      symptom is a node the harness cannot find in a session that has already spent its setup time.
+    """
+    if not ctx.llama_patches:
+        return []
+
+    applied: list[dict[str, str]] = []
+    for rel, want_sha in ctx.llama_patches:
+        patch_path = REPO_ROOT / rel
+        if not patch_path.exists():
+            raise SetupError(
+                f"{rel} is listed in build.llama_cpp_patches but does not exist. The patch is part "
+                "of the build definition, not an optional extra -- a tree without it is a "
+                "different tree than run_config_sha256 claims.")
+        blob = patch_path.read_bytes()
+        got_sha = hashlib.sha256(blob).hexdigest()
+        if got_sha != want_sha:
+            raise SetupError(
+                f"{rel} hashes {got_sha[:16]} but run.yaml pins {want_sha[:16]}. Either the patch "
+                "was edited without updating the pin -- in which case every manifest since is "
+                "wrong about what produced it -- or this is the wrong file. Fix the pin "
+                "deliberately; do not paste the new hash in to make the message go away.")
+
+        if ctx.dry_run:
+            applied.append({"patch": rel, "sha256": got_sha, "status": "dry-run"})
+            continue
+
+        # Already applied? Then the reverse patch is what applies cleanly.
+        reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch_path)],
+                                 cwd=str(ctx.llama_dir), capture_output=True, text=True)
+        if reverse.returncode == 0:
+            applied.append({"patch": rel, "sha256": got_sha, "status": "already-applied"})
+            continue
+
+        forward = subprocess.run(["git", "apply", "--check", str(patch_path)],
+                                 cwd=str(ctx.llama_dir), capture_output=True, text=True)
+        if forward.returncode != 0:
+            raise SetupError(
+                f"{rel} neither applies to nor is already applied to {ctx.llama_dir}: "
+                f"{forward.stderr.strip()}. This tree is not the tree the patch was cut against, "
+                "so building it would produce a binary nothing in the config describes.")
+
+        _run(["git", "apply", str(patch_path)], cwd=ctx.llama_dir, dry_run=False)
+        applied.append({"patch": rel, "sha256": got_sha, "status": "applied"})
+        print(f"  applied {rel}")
+
+    return applied
 
 
 def built_target(ctx: SetupContext, target: str) -> Path | None:
@@ -443,6 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs=args.jobs,
         cuda_arch=str(build.get("cuda_architectures", "75")),
         llama_commit=str(commit),
+        llama_patches=_read_patch_pins(build),
         quant=str(_load_yaml(MODELS_CONFIG)["defaults"]["quant"]),
         models=tuple(args.models),
         hf_token_present=bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")),

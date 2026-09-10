@@ -1,0 +1,12 @@
+{
+  "model": "qwen3-30b-a3b",
+  "handle": "ryzewtf/moe-panel/gguf/qwen3-30b-a3b",
+  "url": "https://www.kaggle.com/models/ryzewtf/moe-panel/gguf/qwen3-30b-a3b",
+  "file": "qwen3-30b-a3b-Q4_K_M.gguf",
+  "size_bytes": 18556686432,
+  "sha256": "2f0058c30d5ffb4df32e0f4db41d213c5c4e5dcd580f7e24fa9e4f54daadaeaa",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "transformers": "4.57.6",
+  "is_f16_intermediate": false,
+  "elapsed_s": 2475.3
+}

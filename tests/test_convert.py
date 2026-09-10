@@ -7,6 +7,8 @@ genuinely need bytes (`convert_hf_to_gguf.py`, `llama-quantize`) are exercised o
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.kaggle_convert import (
@@ -225,3 +227,89 @@ def test_a_checkout_at_the_wrong_commit_is_a_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(kc.subprocess, "run", lambda *a, **k: _Proc())
     with pytest.raises(ConvertError, match="but configs/run.yaml pins"):
         kc.find_llama_tree(ctx)
+
+
+def test_an_mxfp4_source_is_not_charged_for_an_f16_intermediate():
+    """gpt-oss never grows one, and pretending it does refuses runs that would have fitted."""
+    from scripts.kaggle_convert import estimate_peak_gb
+
+    meta = {"approx_size_gb": 12.0}
+    requant = estimate_peak_gb(meta, remote=False, requantizes=True)
+    native = estimate_peak_gb(meta, remote=False, requantizes=False)
+    assert native == 24.0  # source + repacked artifact, both at the native width
+    assert requant > 3 * native  # an F16 intermediate of a 12 GiB Q4 file is ~44 GiB
+
+
+def test_pruning_charges_the_largest_model_not_the_whole_panel(tmp_path, monkeypatch):
+    import scripts.kaggle_convert as kc
+
+    sizes = {"small": 4.0, "large": 18.0}
+    monkeypatch.setattr(kc, "resolve_model", lambda k: {"approx_size_gb": sizes[k]})
+    monkeypatch.setattr(kc, "plan_conversion", lambda k, m, **kw: ConversionPlan(
+        model_key=k, hf_repo="x/y", outtype="f16", quantize_to="Q4_K_M", reason=""))
+
+    keys = list(sizes)
+    peaks = {k: kc.estimate_peak_gb({"approx_size_gb": v}, remote=False) for k, v in sizes.items()}
+
+    monkeypatch.setattr(kc, "_free_gb", lambda p: peaks["large"] + 1)
+    assert kc.check_space(keys, tmp_path, remote=False, prune=True) is None
+    complaint = kc.check_space(keys, tmp_path, remote=False, prune=False)
+    assert complaint is not None and "--prune" in complaint
+
+
+# -- the arch pin applies to collection, not to conversion ------------------------------------
+
+
+def _fake_smi(monkeypatch, compute_cap):
+    """Make step_env see one GPU reporting `compute_cap`."""
+    import src.runtime.setup_kaggle as sk
+
+    class _Proc:
+        stdout = f"NVIDIA Whatever, {compute_cap}, 16384 MiB\n"
+
+    monkeypatch.setattr(sk.subprocess, "run", lambda *a, **k: _Proc())
+
+
+def test_a_collecting_session_refuses_a_gpu_the_run_config_does_not_pin(tmp_path, monkeypatch):
+    """I3: gpu_arch is inside run_config_sha256, so shards from another arch are another run."""
+    from src.runtime.setup_kaggle import SetupError, step_env
+
+    _fake_smi(monkeypatch, "12.0")
+    with pytest.raises(SetupError, match="run_config_sha256"):
+        step_env(_ctx(tmp_path))
+
+
+def test_a_conversion_session_does_not_care_what_gpu_is_in_the_box(tmp_path, monkeypatch):
+    """It compiles no kernels and writes no shards, so the local card is not a fact about the
+    experiment -- and refusing here would only teach the operator to edit the pin."""
+    import dataclasses
+
+    from src.runtime.setup_kaggle import step_env
+
+    _fake_smi(monkeypatch, "12.0")
+    result = step_env(dataclasses.replace(_ctx(tmp_path), cuda=False))
+    assert not result.failed
+    assert "ignoring sm_75" in result.detail
+
+
+# -- what environment produced the artifact ---------------------------------------------------
+
+
+def test_the_record_carries_the_converter_environment():
+    """gemma-4 cannot be converted under the transformers llama.cpp pins, so one checkpoint comes
+    from a different library set. That has to be readable off the artifact, not off a stack trace."""
+    plan = ConversionPlan(model_key="m", hf_repo="a/b", outtype="f16",
+                          quantize_to="Q4_K_M", reason="r")
+    record = ConversionRecord(
+        model_key="m", plan=plan, gguf_path=Path("m-Q4_K_M.gguf"), size_bytes=1,
+        sha256="ab" * 32, llama_commit="c" * 40,
+        converter_env={"transformers": "5.15.1", "torch": "2.11.0+cpu"},
+    )
+    assert record.to_dict()["converter_env"]["transformers"] == "5.15.1"
+
+
+def test_an_interpreter_that_cannot_report_versions_is_not_a_converter_env(tmp_path):
+    from scripts.kaggle_convert import probe_converter_env
+
+    with pytest.raises(ConvertError, match="working converter environment"):
+        probe_converter_env(str(tmp_path / "no-such-python"))

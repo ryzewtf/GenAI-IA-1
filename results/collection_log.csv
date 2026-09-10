@@ -1,0 +1,4 @@
+model,shard_id,n_docs,n_tokens,wall_s,tokens_per_s,exit_code,upload_verified,run_config_sha256
+olmoe-0125-instruct,0,4,817,34.829,23.46,0,1,ac485eebb7f09521e7dbc0e193744837ab4eee93f37521277ea0523e8bdc7a62
+olmoe-0125-instruct,1,4,843,9.658,87.28,0,1,ac485eebb7f09521e7dbc0e193744837ab4eee93f37521277ea0523e8bdc7a62
+olmoe-0125-instruct,2,4,828,9.604,86.22,0,1,ac485eebb7f09521e7dbc0e193744837ab4eee93f37521277ea0523e8bdc7a62

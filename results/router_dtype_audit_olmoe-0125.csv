@@ -1,0 +1,17 @@
+model_key,gguf_file,tensor,dims,ggml_type,n_elements,is_shared_expert_gate,verdict
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.0.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.1.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.2.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.3.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.4.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.5.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.6.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.7.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.8.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.9.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.10.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.11.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.12.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.13.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.14.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS
+olmoe-0125-Q4_K_M,olmoe-0125-Q4_K_M.gguf,blk.15.ffn_gate_inp.weight,2048x64,F32,131072,false,PASS

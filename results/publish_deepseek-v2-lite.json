@@ -1,0 +1,12 @@
+{
+  "model": "deepseek-v2-lite",
+  "handle": "ryzewtf/moe-panel/gguf/deepseek-v2-lite",
+  "url": "https://www.kaggle.com/models/ryzewtf/moe-panel/gguf/deepseek-v2-lite",
+  "file": "deepseek-v2-lite-Q4_K_M.gguf",
+  "size_bytes": 10367958016,
+  "sha256": "967ab33ee0d61ebe38bd974fdc31e4c9a4eea13fd9c72bcec43d7afc9f2bbef1",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "transformers": "4.57.6",
+  "is_f16_intermediate": false,
+  "elapsed_s": 3107.6
+}

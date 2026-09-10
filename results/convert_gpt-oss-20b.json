@@ -1,0 +1,28 @@
+{
+  "model": "gpt-oss-20b",
+  "hf_repo": "openai/gpt-oss-20b",
+  "outtype": "f16",
+  "quantize_to": null,
+  "recipe_reason": "source is MXFP4; converter repacks it natively (plan \u00a70b: do not requantize)",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "converter": "convert_hf_to_gguf.py",
+  "converter_env": {
+    "executable": "D:\\moe\\convert-venv\\Scripts\\python.exe",
+    "python": "3.11.15",
+    "transformers": "4.57.6",
+    "torch": "2.11.0+cpu",
+    "gguf": "0.19.0",
+    "numpy": "1.26.4",
+    "sentencepiece": "0.2.2"
+  },
+  "file": "gpt-oss-20b-F16.gguf",
+  "path": "D:\\moe\\gguf\\gpt-oss-20b-F16.gguf",
+  "size_bytes": 13792638656,
+  "sha256": "87062115cda40f04be2e213e41de1239fc6acf23105a10065312892cd2d0627c",
+  "f16_path": "D:\\moe\\gguf\\gpt-oss-20b-F16.gguf",
+  "f16_sha256": null,
+  "elapsed_s": 1265.1,
+  "notes": [
+    "not quantized: source is MXFP4 and the converter repacked it losslessly (\u00a70b)"
+  ]
+}

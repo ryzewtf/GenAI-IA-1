@@ -27,6 +27,25 @@ hashed:
     # token after the first. Older trees used ggml_top_k (GGML_OP_TOP_K, contiguous). Verified by
     # reading ggml/src/ggml.c at this commit; the callback de-strides unconditionally either way.
     llama_cpp_commit: 7077abbe14c510cb829c93a1328c2815b5805ebd
+
+    # Patches applied on top of the pinned commit, in order, each pinned by the sha256 of its own
+    # bytes. This list is inside run_config_sha256, which is the point: a tree that is "the pinned
+    # commit plus something" is not the pinned commit, and it must not hash as though it were.
+    # Editing a patch file therefore changes the run config hash and every manifest written after,
+    # which is the honest outcome -- the patch changes the code that produces the numbers.
+    llama_cpp_patches:
+      # Gemma 4 routes off a tensor upstream never names. src/models/gemma4.cpp builds TWO
+      # normalizations of attn_out: `ffn_norm_2`, which is cb'd and feeds the EXPERTS, and an
+      # anonymous `tmp = rms_norm(attn_out) * 1/sqrt(n_embd) * ffn_gate_inp_s`, which is what the
+      # ROUTER consumes and which upstream never passes to cb. Both are [n_embd], so no shape check
+      # can tell them apart: without this patch the only options are to capture the wrong tensor
+      # (silently -- F4/F5/FV would condition on a tensor the router never saw, and it would surface
+      # as one unexplained number in a table of seven) or to drop the router-input probes for Gemma.
+      # The patch adds one line, `cb(tmp, "ffn_moe_router_input", il)`. It creates no operation and
+      # changes no arithmetic -- ggml callbacks name existing tensors -- so it cannot move any other
+      # model's numbers, and for Gemma it changes nothing that is computed, only what is visible.
+      - file: patches/gemma4-router-input-cb.patch
+        sha256: a705192c8c258e589dfd1d5d944b21d93961641e63281bc4c56d5237f57b90fb
     ggml_native: false        # -DGGML_NATIVE=OFF — mandatory, see T0.2 (SIGILL on host change)
     ggml_cuda_f16: false      # -DGGML_CUDA_F16=OFF — do not add a precision variable
     cuda_architectures: "75"

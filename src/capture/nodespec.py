@@ -239,15 +239,24 @@ def build_spec(
         verified = True
     elif assume_defaults:
         _, selection = selection_chain(config)
-        node_topk = DEFAULT_NODE_TEMPLATES["topk"]
-        node_router = DEFAULT_NODE_TEMPLATES["router_input"]
-        node_logits = f"{selection}-%d"
+        # A DECLARED name beats the default, field by field. The hypothesis is "what the generic
+        # chain predicts, except where we already know better", and partial knowledge is the normal
+        # state here: Gemma 4's router_input is known from reading gemma4.cpp long before a
+        # eval-callback run can confirm its topk. Overwriting a declared name with a guess would
+        # throw that away silently, and for Gemma the guess (`ffn_norm`) is a node that does not
+        # exist in its MoE layers -- so the spec would predict a name T1.4 could only fail on.
+        node_topk = declared.get("topk") or DEFAULT_NODE_TEMPLATES["topk"]
+        node_router = declared.get("router_input") or DEFAULT_NODE_TEMPLATES["router_input"]
+        node_logits = declared.get("logits") or f"{selection}-%d"
         verified = False
         notes.append(
             "UNVERIFIED hypothesis from llama.cpp master build_moe_ffn. T1.4 must confirm with "
             "llama-eval-callback -ngl 0 -c 512 before this spec is used to collect."
         )
         notes.append(f"predicted selection node: {selection}")
+        for field in ("topk", "logits", "router_input"):
+            if declared.get(field):
+                notes.append(f"{field} taken from models.yaml, not predicted: {declared[field]}")
     else:
         missing = [k for k in ("topk", "router_input") if not declared.get(k)]
         raise NodeSpecError(

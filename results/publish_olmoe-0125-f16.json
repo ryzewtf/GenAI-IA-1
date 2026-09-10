@@ -1,0 +1,12 @@
+{
+  "model": "olmoe-0125",
+  "handle": "ryzewtf/moe-panel/gguf/olmoe-0125-f16",
+  "url": "https://www.kaggle.com/models/ryzewtf/moe-panel/gguf/olmoe-0125-f16",
+  "file": "olmoe-0125-F16.gguf",
+  "size_bytes": 13844566144,
+  "sha256": "93e6a738249ae5d5d39906bd7b3d6fe1724e7733a74edfb9836bf55a51779dc3",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "transformers": "4.57.6",
+  "is_f16_intermediate": true,
+  "elapsed_s": 1981.0
+}

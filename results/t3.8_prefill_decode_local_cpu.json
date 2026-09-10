@@ -1,0 +1,42 @@
+{
+  "task": "T3.8",
+  "status": "FAIL on this configuration",
+  "what": "A LOCAL CPU run, not the plan's T3.7/T3.8 GPU measurement. Reported because the mechanism it exposes is backend-independent and it changes what the Kaggle run should expect to find.",
+  "config": {
+    "host": "local workstation, CPU only (--ngl 0 --threads 8)",
+    "model": "olmoe-0125-instruct Q4_K_M",
+    "corpus": "results/smoke/corpus3.jsonl, 12 docs, 2488 tokens",
+    "n_moe_layers": 16, "n_experts": 64, "top_k": 8,
+    "reference_leg": "--decode-mode off (one batch per document, 12 forward passes)",
+    "candidate_legs": [
+      "--decode-mode full (2488 forward passes, one token each)",
+      "--decode-mode tail --decode-prefix 100 (1300 forward passes)"
+    ]
+  },
+  "acceptance": {"floor": 0.999, "judged_on": "worst layer"},
+  "results": {
+    "full": {"mean_set_agreement": 0.985732, "worst_layer": 15, "worst_set_agreement": 0.976336,
+             "exact_match_worst_layer": 0.818730, "flipped_cells": 4420, "total_cells": 39808,
+             "depth_trend_spearman": 0.959},
+    "tail": {"mean_set_agreement": 0.992872, "worst_layer": 10, "worst_set_agreement": 0.987641,
+             "flipped_cells": 2195, "total_cells": 39808, "depth_trend_spearman": 0.929,
+             "agreement_on_rows_inside_the_prefill_span": 1.0,
+             "n_rows_inside_prefill_span": 1200,
+             "agreement_on_rows_decoded_one_at_a_time": 0.986231,
+             "n_rows_decoded_singly": 1288}
+  },
+  "per_layer_agreement_full": [0.9979, 0.9945, 0.9937, 0.9928, 0.9918, 0.9912, 0.9857, 0.9857,
+                               0.9802, 0.9834, 0.9781, 0.9825, 0.9824, 0.9787, 0.9768, 0.9763],
+  "findings": [
+    "The effect is confined to BATCH SIZE 1. Rows inside the tail leg's 100-token prefill span agree with the 208-token prefill reference at exactly 1.000000 across all 1200 of them. So re-batching at a different size reproduces the reference exactly; only single-token steps diverge.",
+    "Disagreement rises monotonically with depth: layer 0 at 0.9979, layer 15 at 0.9763, Spearman +0.96. Consistent with error accumulating through the stack below the router rather than with a per-layer bug.",
+    "The two candidate legs measure the same phenomenon. tail scores higher than full only because 1200 of its 2488 rows are prefill rows that agree perfectly; its decoded rows sit at 0.9862, matching full's 0.9857.",
+    "logits.bin differs too, so this is arithmetic upstream of the argsort, not a tie-breaking artifact in the top-k itself."
+  ],
+  "caveats": [
+    "CPU, not GPU. ggml selects different matmul paths for n=1 (vec-dot against the quantized weight) and n>1 (activation repacking plus GEMM); CUDA has the same split between dequant-mul-mat-vec and mul_mat_q/cuBLAS. The mechanism is present on both backends, but the magnitude on 2x T4 with -ngl 99 is unmeasured and could differ in either direction.",
+    "Q4_K_M, not F16. Quantized weights make the n=1 vs n>1 kernel difference larger than it would be at F16.",
+    "One model, 2488 tokens. The panel scope decision is whole-panel, so this is the first of seven."
+  ],
+  "implication": "Plan section 0b asserts that teacher-forced prefill yields identical routing to decode, and the whole study interprets prefill measurements as claims about decode-time prefetching. On this configuration that assertion is false by ~1.4% of (token, layer) cells, concentrated in the deep layers the depth analysis reads. If the Kaggle GPU run reproduces it, the framing has to change: the results describe prefill routing, and their decode-time relevance becomes a measured approximation rather than an identity."
+}

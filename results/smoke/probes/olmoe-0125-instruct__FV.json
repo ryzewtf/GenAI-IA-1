@@ -1,0 +1,297 @@
+{
+  "entropy_estimator": "miller_madow",
+  "feature": "FV",
+  "layers": {
+    "0": {
+      "excluded": {
+        "reason": "tokens outside the hidden subsample (0)",
+        "test": 0,
+        "train": 0,
+        "val": 0
+      },
+      "fit": {
+        "best_epoch": 0,
+        "best_val_ce_bits": 10.307206153869629,
+        "blocks": [
+          {
+            "block": "router_input",
+            "kind": "dense",
+            "standardized": true,
+            "width": 2048
+          }
+        ],
+        "design_width": 2048,
+        "epochs_run": 6,
+        "exclusion_reason": null,
+        "feature": "FV",
+        "hyperparams": {
+          "batch_size": 4096,
+          "dtype": "float32",
+          "lr": 0.03,
+          "max_epochs": 60,
+          "optimizer": "adamw",
+          "patience": 5,
+          "schedule": "cosine",
+          "seed": 0,
+          "weight_decay": 0.0001
+        },
+        "layer": 0,
+        "n_excluded": 0,
+        "n_experts": 64,
+        "n_train_rows": 1234,
+        "n_train_slots": 9872,
+        "n_val_rows": 632,
+        "n_val_slots": 5056,
+        "predictor": "softmax_probe",
+        "top_k": 8
+      },
+      "layer": 0,
+      "meta": {
+        "hidden_layer": 0,
+        "hidden_model_layer": 0,
+        "model_layer": 0
+      },
+      "metrics": {
+        "entropy_estimator": "miller_madow",
+        "epsilon_mix": 1e-06,
+        "family_a": {
+          "exact_match": 0.0,
+          "n": 622,
+          "n_experts": 64,
+          "recall@16": 0.7520096463022508,
+          "recall@32": 0.7781350482315113,
+          "recall@8": 0.489951768488746,
+          "set_agreement@k": 0.489951768488746,
+          "top_k": 8
+        },
+        "family_b": {
+          "ce_normalized": 1.6836703797249672,
+          "cross_entropy_bits": 10.102022278349803,
+          "entropy_bits": 4.3762662189199375,
+          "entropy_normalized": 0.729377703153323,
+          "estimator": "miller_madow",
+          "mi_bits": -5.725756059429866,
+          "n_experts": 64,
+          "negative": true,
+          "ratio": -1.3083655730713253,
+          "split": "test"
+        },
+        "n_rows": 622,
+        "n_slots": 4976,
+        "split": "test"
+      },
+      "model_layer": 0,
+      "rows": {
+        "test": 622,
+        "train": 1234,
+        "val": 632
+      },
+      "status": "ok",
+      "validation_gate": {
+        "appendix_only": true,
+        "note": "Data-alignment test, not a result. The router at this layer is a linear map on this exact input, so a linear probe must reach ~100%; a low value means the trace rows are misaligned. Never report FV as a finding (plan T7.7).",
+        "pass": false,
+        "set_agreement@k": 0.489951768488746,
+        "threshold": 0.99
+      }
+    },
+    "15": {
+      "excluded": {
+        "reason": "tokens outside the hidden subsample (0)",
+        "test": 0,
+        "train": 0,
+        "val": 0
+      },
+      "fit": {
+        "best_epoch": 0,
+        "best_val_ce_bits": 8.009197235107422,
+        "blocks": [
+          {
+            "block": "router_input",
+            "kind": "dense",
+            "standardized": true,
+            "width": 2048
+          }
+        ],
+        "design_width": 2048,
+        "epochs_run": 6,
+        "exclusion_reason": null,
+        "feature": "FV",
+        "hyperparams": {
+          "batch_size": 4096,
+          "dtype": "float32",
+          "lr": 0.03,
+          "max_epochs": 60,
+          "optimizer": "adamw",
+          "patience": 5,
+          "schedule": "cosine",
+          "seed": 0,
+          "weight_decay": 0.0001
+        },
+        "layer": 15,
+        "n_excluded": 0,
+        "n_experts": 64,
+        "n_train_rows": 1234,
+        "n_train_slots": 9872,
+        "n_val_rows": 632,
+        "n_val_slots": 5056,
+        "predictor": "softmax_probe",
+        "top_k": 8
+      },
+      "layer": 15,
+      "meta": {
+        "hidden_layer": 15,
+        "hidden_model_layer": 15,
+        "model_layer": 15
+      },
+      "metrics": {
+        "entropy_estimator": "miller_madow",
+        "epsilon_mix": 1e-06,
+        "family_a": {
+          "exact_match": 0.03054662379421222,
+          "n": 622,
+          "n_experts": 64,
+          "recall@16": 0.7956189710610932,
+          "recall@32": 0.832395498392283,
+          "recall@8": 0.6426848874598071,
+          "set_agreement@k": 0.6426848874598071,
+          "top_k": 8
+        },
+        "family_b": {
+          "ce_normalized": 1.209047706144495,
+          "cross_entropy_bits": 7.254286236866971,
+          "entropy_bits": 3.938907684292769,
+          "entropy_normalized": 0.6564846140487949,
+          "estimator": "miller_madow",
+          "mi_bits": -3.315378552574202,
+          "n_experts": 64,
+          "negative": true,
+          "ratio": -0.8416999885006136,
+          "split": "test"
+        },
+        "n_rows": 622,
+        "n_slots": 4976,
+        "split": "test"
+      },
+      "model_layer": 15,
+      "rows": {
+        "test": 622,
+        "train": 1234,
+        "val": 632
+      },
+      "status": "ok",
+      "validation_gate": {
+        "appendix_only": true,
+        "note": "Data-alignment test, not a result. The router at this layer is a linear map on this exact input, so a linear probe must reach ~100%; a low value means the trace rows are misaligned. Never report FV as a finding (plan T7.7).",
+        "pass": false,
+        "set_agreement@k": 0.6426848874598071,
+        "threshold": 0.99
+      }
+    },
+    "7": {
+      "excluded": {
+        "reason": "tokens outside the hidden subsample (0)",
+        "test": 0,
+        "train": 0,
+        "val": 0
+      },
+      "fit": {
+        "best_epoch": 0,
+        "best_val_ce_bits": 7.955857753753662,
+        "blocks": [
+          {
+            "block": "router_input",
+            "kind": "dense",
+            "standardized": true,
+            "width": 2048
+          }
+        ],
+        "design_width": 2048,
+        "epochs_run": 6,
+        "exclusion_reason": null,
+        "feature": "FV",
+        "hyperparams": {
+          "batch_size": 4096,
+          "dtype": "float32",
+          "lr": 0.03,
+          "max_epochs": 60,
+          "optimizer": "adamw",
+          "patience": 5,
+          "schedule": "cosine",
+          "seed": 0,
+          "weight_decay": 0.0001
+        },
+        "layer": 7,
+        "n_excluded": 0,
+        "n_experts": 64,
+        "n_train_rows": 1234,
+        "n_train_slots": 9872,
+        "n_val_rows": 632,
+        "n_val_slots": 5056,
+        "predictor": "softmax_probe",
+        "top_k": 8
+      },
+      "layer": 7,
+      "meta": {
+        "hidden_layer": 7,
+        "hidden_model_layer": 7,
+        "model_layer": 7
+      },
+      "metrics": {
+        "entropy_estimator": "miller_madow",
+        "epsilon_mix": 1e-06,
+        "family_a": {
+          "exact_match": 0.00964630225080386,
+          "n": 622,
+          "n_experts": 64,
+          "recall@16": 0.8006430868167203,
+          "recall@32": 0.8118971061093248,
+          "recall@8": 0.5986736334405145,
+          "set_agreement@k": 0.5986736334405145,
+          "top_k": 8
+        },
+        "family_b": {
+          "ce_normalized": 1.2671377562385449,
+          "cross_entropy_bits": 7.60282653743127,
+          "entropy_bits": 3.8783297754563693,
+          "entropy_normalized": 0.6463882959093948,
+          "estimator": "miller_madow",
+          "mi_bits": -3.7244967619749003,
+          "n_experts": 64,
+          "negative": true,
+          "ratio": -0.9603352416148347,
+          "split": "test"
+        },
+        "n_rows": 622,
+        "n_slots": 4976,
+        "split": "test"
+      },
+      "model_layer": 7,
+      "rows": {
+        "test": 622,
+        "train": 1234,
+        "val": 632
+      },
+      "status": "ok",
+      "validation_gate": {
+        "appendix_only": true,
+        "note": "Data-alignment test, not a result. The router at this layer is a linear map on this exact input, so a linear probe must reach ~100%; a low value means the trace rows are misaligned. Never report FV as a finding (plan T7.7).",
+        "pass": false,
+        "set_agreement@k": 0.5986736334405145,
+        "threshold": 0.99
+      }
+    }
+  },
+  "logit_tensor_used": "ffn_moe_probs",
+  "model": "olmoe-0125-instruct",
+  "n_experts": 64,
+  "n_moe_layers": 16,
+  "run_config_sha256": "ac485eebb7f09521e7dbc0e193744837ab4eee93f37521277ea0523e8bdc7a62",
+  "shard_ids": [
+    0,
+    1,
+    2
+  ],
+  "top_k": 8,
+  "updated_utc": "2026-08-18T03:56:07+00:00"
+}

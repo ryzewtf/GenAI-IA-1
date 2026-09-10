@@ -1,0 +1,24 @@
+{
+  "task": "T0.5",
+  "what": "NOT the T0.5 measurement. A workstation CPU run that exercises the instrument and demonstrates its inconclusive branch. The real number is KGPU, on 2x T4 with -ngl 99.",
+  "host": "local workstation, 16 vCPU, CPU-only (--ngl 0 --threads 8), other work running concurrently",
+  "binary": "build/cpu/moe_trace.exe at llama.cpp 7077abbe",
+  "model": "olmoe-0125-instruct Q4_K_M",
+  "corpus": "results/smoke/corpus3.jsonl (12 docs, 2488 tokens)",
+  "repeats": 4,
+  "modes_tok_per_s": {
+    "no-callback": [116.404, 169.426, 161.517, 202.193],
+    "filter-off": [152.798, 143.025, 150.447, 179.648],
+    "full": [177.213, 164.678, 163.253, 195.087]
+  },
+  "medians": {"no-callback": 165.47, "filter-off": 151.62, "full": 170.95},
+  "ratios": {"observability": 1.091, "readback": 0.887, "total": 0.968},
+  "worst_spread": 0.259,
+  "conclusive": false,
+  "finding": "The tool correctly refused this measurement. total_ratio 0.968 says full capture is FASTER than no callback at all, which cannot be true; the run-to-run spread is 25.9%, larger than the effect. Reporting 0.968 would have fed a fabricated speedup into the Phase 5 projection and from there into Gate Q1, which decides whether the study collects 1M or 500k tokens per model.",
+  "implication": "The real T0.5 run needs a quiet machine and enough repeats that the spread is well under the effect. A Kaggle session is quieter than this workstation, but the guard stays either way.",
+  "side_evidence": {
+    "determinism": "All five streams byte-identical across the 4 independent full-capture processes, so T3.4's CPU half still holds after the --capture-mode change.",
+    "reshard_invariance": "The single 12-doc run's topk.bin and logits.bin are byte-identical to the concatenation of runC's three 4-doc shards produced by the pre-change binary. tokens.bin differs only in the FLAG_HIDDEN_CAPTURED bits, because runC ran --hidden-stride 1 and this run used the default 20; token_id, doc_id and pos_in_doc are identical. The refactor is data-preserving and resharding-invariant."
+  }
+}

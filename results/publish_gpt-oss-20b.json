@@ -1,0 +1,12 @@
+{
+  "model": "gpt-oss-20b",
+  "handle": "ryzewtf/moe-panel/gguf/gpt-oss-20b",
+  "url": "https://www.kaggle.com/models/ryzewtf/moe-panel/gguf/gpt-oss-20b",
+  "file": "gpt-oss-20b-F16.gguf",
+  "size_bytes": 13792638656,
+  "sha256": "87062115cda40f04be2e213e41de1239fc6acf23105a10065312892cd2d0627c",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "transformers": "4.57.6",
+  "is_f16_intermediate": false,
+  "elapsed_s": 3024.8
+}

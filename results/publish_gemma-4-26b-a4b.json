@@ -1,0 +1,12 @@
+{
+  "model": "gemma-4-26b-a4b",
+  "handle": "ryzewtf/moe-panel/gguf/gemma-4-26b-a4b",
+  "url": "https://www.kaggle.com/models/ryzewtf/moe-panel/gguf/gemma-4-26b-a4b",
+  "file": "gemma-4-26b-a4b-Q4_K_M.gguf",
+  "size_bytes": 16795998784,
+  "sha256": "17638a1f5721791fd56b5aec79124821560b3ed1f708c3dedd36c837ddd71a6e",
+  "llama_cpp_commit": "7077abbe14c510cb829c93a1328c2815b5805ebd",
+  "transformers": "5.15.1",
+  "is_f16_intermediate": false,
+  "elapsed_s": 4611.3
+}

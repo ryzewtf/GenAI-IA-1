@@ -1,0 +1,21 @@
+{
+  "task": "T3.2",
+  "what": "NOT the T3.2 gate. A shape/indexing smoke of the comparison core plus a measurement of how much of T3.2's budget the fp16 storage of logits.bin spends before PyTorch is involved.",
+  "method": "compare_shard() fed log(logits.bin) as a stand-in for the HF side. Monotone, so the ranks are identical by construction and the comparison should be perfect.",
+  "shard": "results/smoke/runC/out/traces/olmoe-0125-instruct/corpus3/shard_00000",
+  "n_tokens": 817, "n_docs": 4, "n_moe_layers": 16, "n_experts": 64, "top_k": 8,
+  "result": {
+    "ok": true,
+    "worst_layer": 7,
+    "set_agreement": 0.999541,
+    "exact_match": 0.990208,
+    "spearman": 1.0,
+    "spearman_min_over_layers": 1.0,
+    "frac_rows_with_ties_min": 0.326,
+    "frac_rows_with_ties_max": 0.561
+  },
+  "finding": "It is not 1.0. topk.bin records llama.cpp's argsort over fp32 selection_probs; logits.bin stores those probabilities in fp16, and at a near-tie the rounding reorders them. Storage alone therefore consumes ~1 point of the 3 available under the 0.97 exact_match floor and about half of the 0.001 available under the 0.999 set_agreement floor.",
+  "caveat": "An upper bound, not a prediction: the real HF side arrives in fp32, closer to llama.cpp's fp32 probabilities than the fp16 round trip. Recorded so a marginal T3.2 result is checked against this before anyone hunts a harness bug.",
+  "spearman_note": "1.000000 on every layer confirms the I13 substitution is sound -- logits.bin is post-softmax, and softmax preserves ranks, so the plan's 'Spearman on raw logits' gate survives it.",
+  "still_required": "The real T3.2 run on Kaggle against allenai/OLMoE-1B-7B-0125 in fp16. This file establishes nothing about llama.cpp's correctness."
+}

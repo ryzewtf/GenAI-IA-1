@@ -450,14 +450,21 @@ def test_write_back_refuses_to_silently_change_a_recorded_node(tmp_path):
 
 def test_write_back_preserves_comments(tmp_path):
     """models.yaml is more comment than data — the T1.2 gate result, the pair structure, the
-    GPT-OSS requantization warning. A round trip through PyYAML would delete all of it."""
+    per-checkpoint conversion caveats. A round trip through PyYAML would delete all of it.
+
+    The sentinels are deliberately drawn from comments that describe the panel's *structure*
+    rather than the state of any one artifact: an earlier version watched for the GPT-OSS
+    requantization warning, which stopped existing the day we converted GPT-OSS ourselves and
+    turned a real regression test into a false alarm.
+    """
     from src.capture.nodescan import write_back
 
     path = _models_copy(tmp_path)
     write_back(path, "qwen3-30b-a3b", _Report())
     text = path.read_text(encoding="utf-8")
     assert "GATE PASSED" in text
-    assert "CONFLICTS WITH A FROZEN DECISION" in text
+    assert "comparison structure" in text
+    assert "genuinely controlled" in text
 
 
 def test_write_back_names_an_unknown_model(tmp_path):

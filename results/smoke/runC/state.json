@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "model": "olmoe-0125-instruct",
+  "corpus": "corpus3",
+  "run_config_sha256": "ac485eebb7f09521e7dbc0e193744837ab4eee93f37521277ea0523e8bdc7a62",
+  "n_shards_complete": 3,
+  "n_tokens_complete": 2488,
+  "updated_utc": "2026-08-18T03:52:49+00:00",
+  "shards": {
+    "0": {
+      "shard_id": 0,
+      "n_tokens": 817,
+      "n_captured": 817,
+      "file_sha256": {
+        "tokens.bin": "6eb53e27aa599de7bee0ec672e9be2dc1a6024b2e53c7164f20c6b145dc51038",
+        "topk.bin": "fc8828d28ace960a12587e5eb2674eecaf8ad147791adfe370d1d4f3dc60d142",
+        "logits.bin": "0f2740a3e390bd9611b456e1eed8ffe119b65314127496329e27a371d5c40936",
+        "hidden.bin": "65266ead8e43e54c82efe68342cc18dc099e124bb5c56ea8889c1dde7ce096ad",
+        "hidden_index.bin": "f85d9d8163c511df0bf81277565b692ac839695774f68bb8c2d485a9976ae97b"
+      },
+      "doc_range": [
+        0,
+        4
+      ],
+      "completed_utc": "2026-08-18T03:52:31+00:00",
+      "upload_verified": true
+    },
+    "1": {
+      "shard_id": 1,
+      "n_tokens": 843,
+      "n_captured": 843,
+      "file_sha256": {
+        "tokens.bin": "1a108877a4257f566d52f598af8db6b46dc43591f0c216c24d0950c62812f17d",
+        "topk.bin": "6c48cafa71a34fa3f064490cf2b025e69c8cf0db853e9723e3e49a86a1aac2c9",
+        "logits.bin": "c41b42961a62bc5582719f802ccfde977d2e32bfd3581c3f7cb0ae6e1515f004",
+        "hidden.bin": "8a95d441117798cb5bd81b78cf3699fbed111c2881f9bef6e14f62644a11723e",
+        "hidden_index.bin": "f3a4380d14de46c727c3f897d894f0b52fea74d3efab7ca147aa95020c66e604"
+      },
+      "doc_range": [
+        4,
+        8
+      ],
+      "completed_utc": "2026-08-18T03:52:41+00:00",
+      "upload_verified": true
+    },
+    "2": {
+      "shard_id": 2,
+      "n_tokens": 828,
+      "n_captured": 828,
+      "file_sha256": {
+        "tokens.bin": "f1ad0b8b2c9287d357a0eadc557f52c523a6a062587312da1d18125f3c5ad549",
+        "topk.bin": "fc7ab252a0c8a5721966576c3b9c9b0adab890b92d2229bb84b971e3b8904b77",
+        "logits.bin": "fe35ecbbb34994276777e1569cf3692e0f0950d5d6f8fed047845b942b6be536",
+        "hidden.bin": "850688b398ebdc66ac32692b09fdde4ca5a442e52b8ad4f371804743b7f62ae9",
+        "hidden_index.bin": "59820b2eec15fc6f41dc6a0a4b88f0f336638e72d3779b5b611dee46ddfdf878"
+      },
+      "doc_range": [
+        8,
+        12
+      ],
+      "completed_utc": "2026-08-18T03:52:49+00:00",
+      "upload_verified": true
+    }
+  }
+}

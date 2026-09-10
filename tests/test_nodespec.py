@@ -173,6 +173,37 @@ def test_assume_defaults_produces_an_explicitly_unverified_spec(models):
     assert any("UNVERIFIED" in n for n in spec.notes)
 
 
+def test_a_declared_name_beats_the_default_field_by_field(models):
+    """Partial knowledge is the normal state between reading the source and running T1.4.
+
+    Gemma 4 is the case that forced this: its router input is known from `gemma4.cpp` (and from the
+    patch that names it) long before an eval-callback run can confirm its topk. An all-or-nothing
+    rule would overwrite that with the generic default `ffn_norm`, which in a Gemma MoE layer names
+    no node at all -- so the hypothesis spec would predict a name T1.4 could only ever fail on, and
+    the obvious "fix" is to substitute the nearest name that resolves, which is the wrong tensor.
+    """
+    config = dict(models["models"]["olmoe-0125"])
+    config["node_names"] = {"logits": None, "logits_biased": None, "topk": None,
+                            "router_input": "some_other_node-%d"}
+    patched = {"models": dict(models["models"], **{"olmoe-0125": config})}
+
+    spec = build_spec("olmoe-0125", patched, assume_defaults=True)
+
+    assert spec.node_router_input == "some_other_node-%d"        # declared wins
+    assert spec.node_topk == DEFAULT_NODE_TEMPLATES["topk"]      # undeclared still predicted
+    assert spec.verified is False                                # and it is still a hypothesis
+    assert any("router_input taken from models.yaml" in n for n in spec.notes), (
+        "a spec that mixes declared and predicted names must say which is which")
+
+
+def test_the_gemma_hypothesis_names_the_patched_router_node(models):
+    """End to end on the real config: the patch, models.yaml and the generated spec must agree, or
+    the capture looks for a node the binary does not emit."""
+    spec = build_spec("gemma-4-26b-a4b", models, assume_defaults=True)
+    assert spec.node_router_input == "ffn_moe_router_input-%d"
+    assert spec.verified is False
+
+
 def test_hypothesis_spec_uses_the_predicted_selection_node(models):
     spec = build_spec("gpt-oss-20b", models, assume_defaults=True)
     _, selection = selection_chain(models["models"]["gpt-oss-20b"])

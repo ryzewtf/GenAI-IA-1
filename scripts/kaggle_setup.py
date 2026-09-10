@@ -21,8 +21,8 @@ What it adds over the general script, each for a measured reason:
   ``huggingface_hub`` and there are open reports of it hanging at 0% or 99% specifically inside
   managed notebooks including Kaggle. The plain HTTPS path is slower in theory and finishes in
   practice. Its known failure mode is files over ~50 GB; the largest here is 17.3 GiB.
-* **An attached Kaggle Dataset wins over downloading.** If the GGUF is already mounted read-only
-  under ``/kaggle/input``, use it: it costs no session time, no bandwidth, and a pinned dataset
+* **An attached Kaggle input wins over downloading.** If the GGUF is already mounted read-only
+  under ``/kaggle/input``, use it: it costs no session time, no bandwidth, and a pinned model
   version is *immutable*, which is what T3.6's cross-session byte-identity gate actually wants.
   A re-download from the Hub every session is a trace whose weights could change under it.
 * **SHA256 is computed from the bytes on this disk, never copied from the Hub or from
@@ -120,8 +120,10 @@ def resolve_model(model_key: str) -> dict[str, Any]:
         )
     # `repo: null` with a filename is not a half-filled entry -- it is what
     # `scripts/kaggle_convert.py --write` records for a GGUF this project converted itself, which
-    # by definition lives in no HF repo. Such a model must be found on disk (an attached Kaggle
-    # Dataset or the scratch mount); `acquire_gguf` enforces that rather than downloading.
+    # by definition lives in no HF repo. `gguf.kaggle` then names the Kaggle Model variation it was
+    # published to -- `owner/moe-panel/gguf/<variation>`, four parts, see scripts/kaggle_publish.py
+    # -- and `acquire_gguf` resolves through that, an attached mount, or
+    # the scratch copy -- never by guessing an HF repo.
     return meta
 
 
@@ -134,28 +136,56 @@ def acquire_gguf(
     # NOT str(...): `str(None)` is "None", which is truthy, and would send a converted model down
     # the download path to fetch a repo literally named None.
     repo = gguf.get("repo") or ""
+    handle = gguf.get("kaggle") or ""
 
     attached = find_attached_gguf(filename)
     if attached is not None:
-        _say(f"  using attached Kaggle Dataset copy: {attached}")
+        _say(f"  using attached Kaggle input copy: {attached}")
         path = attached
     else:
         dest_dir = ctx.models_dir / model_key
         path = dest_dir / filename
+        scratch_copy = next(iter((ctx.scratch / "gguf").glob(filename)), None)
         if path.exists():
             _say(f"  already downloaded: {path}")
-        elif not repo:
-            scratch_copy = next(iter((ctx.scratch / "gguf").glob(filename)), None)
-            if scratch_copy is None:
-                raise SetupError(
-                    f"{model_key} records gguf.repo: null, meaning this GGUF was converted by "
-                    f"scripts/kaggle_convert.py rather than downloaded -- so {filename} has to be "
-                    "on disk already. It is not under /kaggle/input, "
-                    f"{dest_dir}, or {ctx.scratch / 'gguf'}. Either attach the Kaggle Dataset "
-                    "holding the converted panel, or re-run the conversion in a CPU session."
-                )
+        elif scratch_copy is not None:
+            # A CPU session that just converted this model has it right here; fetching the copy
+            # we uploaded from these very bytes would be a slow way to get the same file.
             _say(f"  using converted copy from this session: {scratch_copy}")
             path = scratch_copy
+        elif handle:
+            _say(f"  fetching Kaggle Model {handle} ...")
+            try:
+                import kagglehub
+            except ImportError as exc:
+                raise SetupError(
+                    "kagglehub is needed to resolve gguf.kaggle handles and is not importable. "
+                    "It is in the Kaggle image; elsewhere, pip install kagglehub."
+                ) from exc
+            try:
+                root = Path(kagglehub.model_download(handle))
+            except Exception as exc:
+                raise SetupError(
+                    f"could not fetch {handle}: {type(exc).__name__}: {exc}. These models are "
+                    "private, so a session without credentials sees them as missing rather than "
+                    "as forbidden -- check the token before concluding the model is gone."
+                ) from None
+            found = next(iter(root.rglob(filename)), None)
+            if found is None:
+                raise SetupError(
+                    f"{handle} downloaded to {root} but holds no {filename}. The Kaggle Model and "
+                    "models.yaml disagree about what was published."
+                )
+            path = found
+        elif not repo:
+            raise SetupError(
+                f"{model_key} records gguf.repo: null and no gguf.kaggle handle, meaning this "
+                f"GGUF was converted by scripts/kaggle_convert.py rather than downloaded -- so "
+                f"{filename} has to be on disk already. It is not under /kaggle/input, "
+                f"{dest_dir}, or {ctx.scratch / 'gguf'}. Publish it with "
+                "scripts/kaggle_publish.py --write, attach the Kaggle Model holding it, or "
+                "re-run the conversion in a CPU session."
+            )
         else:
             free_gb = shutil.disk_usage(ctx.scratch).free / 2**30
             _say(f"  downloading {repo}/{filename} -> {dest_dir}  ({free_gb:.0f} GiB free)")
@@ -210,7 +240,8 @@ def acquire_gguf(
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / f"gguf_sha256_{model_key}.json").write_text(
         json.dumps(
-            {"model": model_key, "repo": repo, "file": filename, "path": str(path),
+            {"model": model_key, "repo": repo, "kaggle": handle, "file": filename,
+             "path": str(path),
              "size_bytes": size, "sha256": digest, "source": "attached" if attached else "download"},
             indent=2,
         ),

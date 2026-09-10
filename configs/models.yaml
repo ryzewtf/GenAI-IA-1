@@ -55,8 +55,8 @@ models:
     approx_size_gb: 4.2
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
-    gguf: {repo: null, file: null, sha256: null, size_bytes: null}   # T1.1
-    router_dtype: null                  # T1.2
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0125, file: olmoe-0125-Q4_K_M.gguf, sha256: 57c420a91615c999acec2ae527244fb43aac04029a4daabda8bd5c85b5e9e10b, size_bytes: 4213512320}
+    router_dtype: F32
     node_names: {logits: null, logits_biased: null, topk: null, router_input: null}  # T1.4
     logit_tensor_used: null             # T1.4
 
@@ -87,16 +87,17 @@ models:
     approx_size_gb: 4.2
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
-    # FIRST DOWNLOAD of the panel and the T1.4 vehicle: smallest checkpoint (7B total / 1B active),
-    # and the only OLMoE variant with a first-party GGUF — the 0125 and 0924 *base* repos publish
-    # none. It is a real panel entry, not a stand-in, so verifying node names here covers arch
-    # `olmoe`, which is 3 of the 7 checkpoints. sha256/size_bytes stay null until T1.1 verifies them
-    # against the downloaded bytes; recording a hash we have not computed would defeat the check.
-    # VERIFIED T1.1 — computed from the downloaded bytes on 2026-08-17, not copied from the Hub.
-    gguf: {repo: allenai/OLMoE-1B-7B-0125-Instruct-GGUF,
-           file: OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf,
-           sha256: 4ddc0e53159ed512b8dd67914a66e27bc618f694672ba43a9a0454eabd9c684f,
-           size_bytes: 4213512192}
+    # The T1.4 vehicle: smallest checkpoint (7B total / 1B active), and a real panel entry rather
+    # than a stand-in, so verifying node names here covers arch `olmoe`, which is 3 of the 7
+    # checkpoints. It was also the first artifact the pipeline ever downloaded, back when the panel
+    # used allenai's first-party GGUF; T1.4's node names were read from that build.
+    # VERIFIED T1.1 — this is now OUR conversion, not allenai's, published 2026-08-24. The whole
+    # panel is converted from safetensors under one recipe so that precision is a constant rather
+    # than a per-checkpoint accident, which is what makes the T8.1 ladder and every cross-model
+    # comparison mean anything. The sha256 is computed from the bytes we uploaded. The node names
+    # below predate the reconversion and describe an artifact with a different hash: re-confirm
+    # them against this file before T3 collection trusts them (invariant I13).
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0125-instruct, file: olmoe-0125-instruct-Q4_K_M.gguf, sha256: c2502f0d9e5ec056c6f5ba87a9fa14aed3cfa7833811a70e9393318b8a86ca7c, size_bytes: 4213512960}
     # VERIFIED T1.2 — GATE PASSED. `python -m src.capture.router_audit` found 16 ffn_gate_inp
     # tensors, all F32, in a checkpoint whose experts are Q4_K. The count independently confirms
     # n_moe_layers: 16 with first_k_dense_replace: 0 from the artifact rather than from config.json.
@@ -144,8 +145,8 @@ models:
     approx_size_gb: 4.2
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
-    gguf: {repo: null, file: null, sha256: null, size_bytes: null}
-    router_dtype: null
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0924, file: olmoe-0924-Q4_K_M.gguf, sha256: 9243992f6c421591a027b8740f835318017fb29dbcbb56e435d322c79f238622, size_bytes: 4213512064}
+    router_dtype: F32
     node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
     logit_tensor_used: null
     drop_order: 1                        # first cut if quota binds
@@ -172,25 +173,18 @@ models:
     has_router_bias: true                # VERIFIED §1.6
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_local_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
-    gguf: {repo: unsloth/gpt-oss-20b-GGUF,
-           file: gpt-oss-20b-Q4_K_M.gguf,
-           sha256: null,
-           size_bytes: null}
-    # !! CONFLICTS WITH A FROZEN DECISION (plan §0b, T1.1): "GPT-OSS: native MXFP4, do not
-    # requantize." A Q4_K_M build of gpt-oss-20b is a REQUANTIZATION of weights that were released
-    # in MXFP4 — it is a lossy transform of an already-lossy format, applied by a third party.
-    # Consequences, all of which are real rather than pedantic:
-    #   * Phase 8 has no uncompressed reference for GPT-OSS and T8.4 already exempts it, so this
-    #     checkpoint's quantization error is unbounded and unmeasurable within this study.
-    #   * §1.6 depends on GPT-OSS's ROUTER BIAS being present and exact; T1.2 must confirm the
-    #     router (and any bias tensor) survived as F32. If the requantization touched it, Pair G
-    #     is compromised.
-    #   * T3.2's GPT-OSS path (plan C11) assumes the MXFP4 weights transformers loads. Comparing
-    #     a Q4_K_M GGUF against an MXFP4 PyTorch forward measures the requantization, not the
-    #     harness.
-    # Kept as recorded so the panel is runnable, but flagged: prefer an MXFP4/F16 GGUF of
-    # gpt-oss-20b if one exists, and if this file is used, say so in the limitations section.
-    router_dtype: null
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/gpt-oss-20b, file: gpt-oss-20b-F16.gguf, sha256: 87062115cda40f04be2e213e41de1239fc6acf23105a10065312892cd2d0627c, size_bytes: 13792638656}
+    # RESOLVED — this entry used to name a third-party Q4_K_M build, which conflicted with the
+    # frozen decision in plan §0b ("GPT-OSS: native MXFP4, do not requantize") because requantizing
+    # MXFP4 to Q4_K_M is a lossy transform of an already-lossy format. The file recorded here is
+    # our own conversion and is NOT a requantization: convert_hf_to_gguf detects the MXFP4 source
+    # (`_is_mxfp4`), promotes the file type to MOSTLY_MXFP4_MOE, and repacks the expert tensors
+    # losslessly; the quantize step is skipped entirely, which is why the name says F16 while the
+    # experts stay MXFP4. The three consequences that flag listed are therefore gone: §1.6's router
+    # bias and T3.2's PyTorch cross-check now compare against the weights as released. T8.4 still
+    # exempts this checkpoint from the precision ladder — there is no uncompressed reference to
+    # ladder against — but that is a property of the release, not of anything we did to it.
+    router_dtype: F32
     node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
     logit_tensor_used: null
     notes: >
@@ -224,14 +218,13 @@ models:
     approx_size_gb: 10.4
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: n_routed_experts, top_k: num_experts_per_tok, aux_loss: aux_loss_alpha, nesting: null}
-    gguf: {repo: wantsleep/DeepSeek-V2-Lite-Q4_K_M-GGUF,
-           file: deepseek-v2-lite-q4_k_m.gguf,
-           sha256: null,
-           size_bytes: null}
-    # THIRD-PARTY CONVERSION, same caveat as Gemma. This checkpoint is also the T3.5 layer-map
-    # spot check (first_k_dense_replace: 1 => model layer 0 is dense, trace layer 0 is model
-    # layer 1), so a converter that renumbered blocks would show up there first.
-    router_dtype: null
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/deepseek-v2-lite, file: deepseek-v2-lite-Q4_K_M.gguf, sha256: 967ab33ee0d61ebe38bd974fdc31e4c9a4eea13fd9c72bcec43d7afc9f2bbef1, size_bytes: 10367958016}
+    # OUR CONVERSION (T1.1, 2026-08-24), replacing the third-party build this entry used to name.
+    # This checkpoint is the T3.5 layer-map spot check (first_k_dense_replace: 1 => model layer 0
+    # is dense, trace layer 0 is model layer 1), so a converter that renumbered blocks would show
+    # up there first. That check is still worth running: it now tests our converter rather than
+    # someone else's, which is the version of the question that matters.
+    router_dtype: F32
     node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
     logit_tensor_used: null
 
@@ -252,11 +245,8 @@ models:
     approx_size_gb: 18.6
     device_plan: {n_gpu: 2, split_mode: layer, tensor_split: [0.5, 0.5]}   # pinned; see T8.5
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
-    gguf: {repo: unsloth/Qwen3-30B-A3B-GGUF,
-           file: Qwen3-30B-A3B-Q4_K_M.gguf,
-           sha256: null,          # T1.1 — computed from the bytes on the Kaggle disk, never copied
-           size_bytes: 18556686912}   # measured locally 2026-08-18
-    router_dtype: null
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/qwen3-30b-a3b, file: qwen3-30b-a3b-Q4_K_M.gguf, sha256: 2f0058c30d5ffb4df32e0f4db41d213c5c4e5dcd580f7e24fa9e4f54daadaeaa, size_bytes: 18556686432}
+    router_dtype: F32
     node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
     logit_tensor_used: null
     notes: >
@@ -281,7 +271,19 @@ models:
     moe_layer_offset: 0
     hidden_dim: 2816                     # VERIFIED §1.4 (not 2048)
     moe_intermediate_size: 704
-    post_topk: normalized+per_expert_scale   # O1 CLOSED — see §1.4 / T1.3
+    # O1 REOPENED AND RE-CLOSED (T1.2 artifact + llama.cpp source, 2026-08-24). This read
+    # `normalized+per_expert_scale`; the per-expert-scale half is WRONG. The tensor behind that
+    # reading is `blk.N.ffn_gate_inp.scale`, and the audit shows it is **2816 = hidden_dim wide,
+    # not 128 = n_experts**, so it cannot be a per-expert anything. src/models/gemma4.cpp:290-293
+    # says what it actually is -- a scale on the router INPUT, applied before the router matmul:
+    #     tmp = rms_norm(attn_out); tmp = tmp * (1/sqrt(n_embd)); tmp = tmp * ffn_gate_inp_s
+    #     logits = ffn_gate_inp @ tmp
+    # It is part of computing the logits, not a transform applied after top-k. What happens after
+    # top-k is plain softmax renormalization over the selected experts (build_moe_ffn is called
+    # with GATING_FUNC_TYPE_SOFTMAX and norm_w = true), which is exactly `normalized` -- the same
+    # value Qwen3 carries. Gemma and Qwen3 are therefore post-topk-identical, which makes Pair T
+    # cleaner than it was recorded as being.
+    post_topk: normalized
     aux_loss: {key: null, value: null}   # absent from config
     # CORRECTED (T1.3): planning recorded shared_experts: 0 plus a parallel dense MLP. The published
     # architecture is "8 active / 128 total AND 1 shared" — an always-on expert, however llama.cpp
@@ -294,9 +296,22 @@ models:
     #   * 128 is the routed count and therefore the normalizer; top_k 8 is over the routed experts
     #   * Pair T is not architecture-matched, and Gemma groups with DeepSeek wherever always-on
     #     capacity is discussed (§1.5, T9.3)
+    # VERIFIED T1.2 (artifact) — no `ffn_gate_inp.bias` tensor exists in the GGUF, and gemma4.cpp
+    # passes `nullptr` for exp_probs_b. Contrast GPT-OSS, whose bias IS present and is 32 = n_experts
+    # wide. T1.3 should confirm against config.json, but a bias that is absent from both the weights
+    # and the forward pass is not going to appear there.
+    has_router_bias: false
     shared_experts: 1                    # VERIFIED T1.3 — was 0; see above
     parallel_dense_mlp: true             # VERIFIED §1.4 — may be the same always-on branch as above
-    shared_expert_implementation: unresolved   # T1.4 settles which of the two it is in llama.cpp
+    # RESOLVED from src/models/gemma4.cpp:283-317 (was `unresolved`, pending T1.4). llama.cpp
+    # implements the always-on capacity as a **parallel dense MLP**, not as an always-selected
+    # expert: `cur_mlp = build_ffn(ffn_norm_1, ffn_up/ffn_gate/ffn_down)` runs on the non-expert
+    # tensors and is added to the MoE branch (`cur = cur_mlp + cur_moe`, cb'd `ffn_moe_combined`).
+    # It never passes through the router and occupies no slot in the 128. Consequences are the ones
+    # already recorded: it carries no routing information and is excluded from every entropy and MI
+    # quantity, and 128 stays the normalizer. Unlike DeepSeek's shared experts, it is not even in
+    # the expert tensors, so there is no index to exclude -- the exclusion is automatic here.
+    shared_expert_implementation: parallel_dense_mlp
     # Router lives at model.language_model.layers[i].router — NOT .mlp (.mlp is the dense branch).
     # A hook on .mlp captures the wrong tensor.
     router_module_path: model.language_model.layers.{i}.router
@@ -306,17 +321,69 @@ models:
     approx_size_gb: 15.5
     device_plan: {n_gpu: 2, split_mode: layer, tensor_split: [0.5, 0.5]}
     config_keys: {experts: num_experts, top_k: top_k_experts, aux_loss: null, nesting: text_config}
-    gguf: {repo: mradermacher/gemma-4-26B-A4B-GGUF,
-           file: gemma-4-26B-A4B.Q4_K_M.gguf,
-           sha256: null,
-           size_bytes: null}
-    # THIRD-PARTY CONVERSION. Google publishes no first-party GGUF, so this is mradermacher's
-    # conversion. T1.3 (config verification against config.json) and T1.2 (router dtype) are
-    # therefore load-bearing here in a way they are not for the first-party OLMoE build: a
-    # third-party convert_hf_to_gguf run is exactly where a wrong --outtype or a stale converter
-    # would enter the panel. Do not skip them for this checkpoint.
-    router_dtype: null
-    node_names: {logits: null, logits_biased: null, topk: null, router_input: null}
+    gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/gemma-4-26b-a4b, file: gemma-4-26b-a4b-Q4_K_M.gguf, sha256: 17638a1f5721791fd56b5aec79124821560b3ed1f708c3dedd36c837ddd71a6e, size_bytes: 16795998784}
+    # OUR CONVERSION (T1.1, 2026-08-24), replacing mradermacher's build this entry used to name.
+    # Google publishes no first-party GGUF. This one needed transformers 5.15.1 to convert at all:
+    # its tokenizer_config.json carries `extra_special_tokens` as a LIST, and 4.57.6 calls .keys()
+    # on it. T1.3 (config verification against config.json) and T1.2 (router dtype) stay
+    # load-bearing here — a converter new enough to be the only one that works is also the one
+    # least covered by the rest of the panel's runs.
+    # RESOLVED 2026-08-24 — option (a): llama.cpp is patched to name the tensor. The problem and
+    # why the other two options were rejected are kept below, because the patch only makes sense to
+    # someone who knows what it is for.
+    #
+    # `patches/gemma4-router-input-cb.patch` adds one line to src/models/gemma4.cpp:
+    #     cb(tmp, "ffn_moe_router_input", il);
+    # A ggml callback names an existing tensor. It creates no operation and changes no arithmetic,
+    # so it cannot move any other model's numbers, and for Gemma it changes nothing that is
+    # computed -- only what is visible. The patch is pinned by sha256 in
+    # configs/run.yaml:build.llama_cpp_patches, which is inside run_config_sha256, so a tree that
+    # is "the pinned commit plus this" does not hash as though it were the bare pinned commit.
+    # setup applies it, verifies it, and refuses to build if it neither applies nor is already
+    # applied.
+    #
+    # ORIGINAL PROBLEM — Gemma 4 routes off a tensor that llama.cpp never names.
+    #
+    # Every other architecture in the panel feeds the router the same normalized hidden state it
+    # feeds the experts, cb'd as `ffn_norm`. Gemma 4 does not. src/models/gemma4.cpp:283-294 builds
+    # TWO separate normalizations of `attn_out`:
+    #   * `ffn_norm_2` = build_norm(attn_out, ffn_pre_norm_2)   -- cb'd, and feeds THE EXPERTS
+    #   * `tmp`        = rms_norm(attn_out) * 1/sqrt(n_embd) * ffn_gate_inp_s -- NOT cb'd, and is
+    #                    the tensor the router matmul actually consumes
+    # The comment in the source says so outright: "router operates on attn_out, not cur".
+    #
+    # Why this is dangerous rather than merely awkward: `tmp` and `ffn_norm_2` are both [2816],
+    # so T1.4's shape check CANNOT tell them apart. Wiring router_input to `ffn_norm_2` would pass
+    # every gate the harness has and silently condition F4/F5/FV on a tensor the router never saw.
+    # The failure would surface as an unexplained FV result for one model in a table of seven.
+    # The generated spec currently predicts `ffn_norm-%d`, which does not exist in a Gemma MoE
+    # layer at all -- so today T1.4 fails LOUDLY here, which is the safe state. Do not "fix" that
+    # by substituting the nearest name that resolves.
+    #
+    # Three ways out, none of them free, decision required before Gemma collection:
+    #   1. Patch llama.cpp to `cb(tmp, "ffn_moe_router_input", il)` and rebuild. Correct, and cheap
+    #      in code, but it moves llama_cpp_commit off the pinned 7077abbe that every other trace in
+    #      the study was collected under.
+    #   2. Reconstruct the router input offline from `ffn_norm_2` -- impossible: ffn_pre_norm_2 and
+    #      ffn_gate_inp_s are different learned vectors, so one is not a rescaling of the other.
+    #   3. Drop F4/F5/FV for Gemma and say so. Costs the router-input arm of Pair T.
+    # Recorded here rather than in the task list because the next person to touch this file needs
+    # it before they touch node_names.
+    #
+    # NOT a hazard, checked: gemma4.cpp precomputes the logits and passes them into build_moe_ffn
+    # as `probs_in`, which takes the `else` branch at llama-graph.cpp:1953 and does NOT re-cb.
+    # `ffn_moe_logits` is therefore emitted exactly once per layer and T1.4's at-most-one half is
+    # not at risk here.
+    router_dtype: F32
+    # router_input is `ffn_moe_router_input`, which exists only because
+    # patches/gemma4-router-input-cb.patch adds it -- see the blocker note above and
+    # configs/run.yaml:build.llama_cpp_patches. A session built without that patch will not find
+    # this node, which is the intended behaviour: failing to resolve a name is loud, and capturing
+    # `ffn_norm_2` instead would be silent and wrong.
+    # STILL UNVERIFIED: these are the names to CONFIRM with llama-eval-callback in a T1.4 gates
+    # session, not a confirmed result. logits/topk stay null until that run.
+    node_names: {logits: null, logits_biased: null, topk: null,
+                 router_input: ffn_moe_router_input-%d}
     logit_tensor_used: null
 
 # --- comparison structure (§1.5) ---------------------------------------------------------------

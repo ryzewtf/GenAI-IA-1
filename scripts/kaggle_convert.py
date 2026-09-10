@@ -76,7 +76,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -301,14 +301,17 @@ def download_source(plan: ConversionPlan, dest: Path) -> Path:
 
 
 def convert_to_gguf(plan: ConversionPlan, source: Path | str, outfile: Path, *,
-                    llama_tree: Path, remote: bool) -> Path:
+                    llama_tree: Path, python: str, remote: bool) -> Path:
     """Run the pinned `convert_hf_to_gguf.py`. This is the step the whole script exists for."""
     if outfile.exists():
         _say(f"  {outfile.name} already converted ({outfile.stat().st_size / 2**30:.1f} GiB)")
         return outfile
     converter = llama_tree / "convert_hf_to_gguf.py"
     outfile.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, str(converter), str(source),
+    # `python` rather than sys.executable: the converter's pinned requirements (numpy~=1.26.4,
+    # transformers==4.57.6, torch==2.11.0) do not co-install with this project's analysis stack,
+    # so on a workstation it runs from its own venv while the driver keeps running from this one.
+    cmd = [python, str(converter), str(source),
            "--outfile", str(outfile), "--outtype", plan.outtype]
     if remote:
         # Streams the safetensors straight from the Hub. Saves the source copy entirely (~57 GiB
@@ -367,6 +370,43 @@ def verify_router_dtype(model_key: str, gguf_path: Path) -> None:
 # -- record ----------------------------------------------------------------------------------
 
 
+def probe_converter_env(python: str) -> dict[str, Any]:
+    """Versions of the libraries that shape the converter's output.
+
+    Not decoration. gemma-4's tokenizer_config.json carries `extra_special_tokens` as a LIST, which
+    the transformers pinned by llama.cpp's own requirements (4.57.6) cannot read -- it calls
+    .keys() on it -- so that checkpoint has to be converted under a newer one. The weights are
+    untouched by this; the vocab is not. An asymmetry the artifacts do not record is an asymmetry
+    someone has to rediscover later from a stack trace.
+    """
+    code = (
+        "import json, platform, sys\n"
+        "import importlib.metadata as md\n"
+        "def v(m):\n"
+        "    try: return md.version(m)\n"
+        "    except Exception: return None\n"
+        "print(json.dumps({'executable': sys.executable, 'python': platform.python_version(),\n"
+        "                  'transformers': v('transformers'), 'torch': v('torch'),\n"
+        "                  'gguf': v('gguf'), 'numpy': v('numpy'),\n"
+        "                  'sentencepiece': v('sentencepiece')}))"
+    )
+    try:
+        proc = subprocess.run([python, "-c", code], capture_output=True, text=True, check=False)
+    except OSError as exc:
+        # A mistyped --python is the likeliest way to get here, and it is worth catching now
+        # rather than after the download: the converter would fail the same way an hour later.
+        raise ConvertError(
+            f"{python} is not a working converter environment: {exc}"
+        ) from None
+    if proc.returncode != 0:
+        raise ConvertError(
+            f"{python} could not report its package versions, so it is not a working converter "
+            f"environment: {(proc.stderr or '').strip()[:300]}"
+        )
+    return json.loads(proc.stdout)
+
+
+
 @dataclass
 class ConversionRecord:
     model_key: str
@@ -379,6 +419,7 @@ class ConversionRecord:
     f16_sha256: str | None = None
     elapsed_s: float = 0.0
     notes: list[str] = field(default_factory=list)
+    converter_env: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -391,6 +432,7 @@ class ConversionRecord:
             # sha256, and this file is what maps that hash back to a source repo and a converter.
             "llama_cpp_commit": self.llama_commit,
             "converter": "convert_hf_to_gguf.py",
+            "converter_env": self.converter_env,
             "file": self.gguf_path.name,
             "path": str(self.gguf_path),
             "size_bytes": self.size_bytes,
@@ -441,6 +483,67 @@ def register(record: ConversionRecord, *, force: bool) -> list[str]:
 # -- driver ----------------------------------------------------------------------------------
 
 
+#: Bytes per parameter of a Q4_K_M GGUF, used only to turn `approx_size_gb` in configs/models.yaml
+#: back into a parameter count. Measured across the panel's published Q4_K_M files; good to ~10%,
+#: which is all the space check below needs.
+Q4_K_M_BYTES_PER_PARAM = 0.55
+
+
+def estimate_peak_gb(meta: Mapping[str, Any], *, remote: bool, requantizes: bool = True) -> float:
+    """Worst-moment disk for one model, in GiB, or 0.0 when models.yaml cannot say.
+
+    The peak is not the final artifact: it is the instant the F16 intermediate is complete and the
+    source is still on disk, because --prune can only delete the source once the converter has
+    finished reading it. --remote removes the source term entirely.
+
+    An MXFP4 source (gpt-oss) never grows an F16 intermediate -- the converter repacks it at its
+    native width and quantization is skipped -- so treating it like the rest overstates its peak
+    by a factor of four, which is enough to refuse a run that would have fitted.
+    """
+    approx = float(meta.get("approx_size_gb") or 0.0)
+    if approx <= 0:
+        return 0.0
+    if not requantizes:
+        return approx * (1.0 if remote else 2.0)
+    f16 = approx / Q4_K_M_BYTES_PER_PARAM * 2.0
+    return f16 + approx + (0.0 if remote else f16)
+
+
+def check_space(keys: Sequence[str], scratch: Path, *, remote: bool, prune: bool) -> str | None:
+    """Reason the run cannot fit on `scratch`, or None.
+
+    Front-loaded because the alternative is discovering it 90 minutes into Qwen3: on a workstation
+    the default scratch is %TEMP%, which is usually the system drive and usually the small one, and
+    a conversion that fills the system drive is a worse afternoon than a conversion that refuses to
+    start.
+    """
+    peaks = []
+    for key in keys:
+        meta = resolve_model(key)
+        try:
+            requantizes = plan_conversion(key, meta).requantizes
+        except ConvertError:
+            requantizes = True
+        peaks.append(estimate_peak_gb(meta, remote=remote, requantizes=requantizes))
+    if not any(peaks):
+        return None
+    # With --prune each model's source and F16 are gone before the next begins, so the requirement
+    # is the largest single model. Without it, everything accumulates.
+    need = max(peaks) if prune else sum(peaks)
+    free = _free_gb(scratch)
+    if free >= need:
+        return None
+    return (
+        f"{scratch} has {free:.0f} GiB free but this run needs about {need:.0f} GiB "
+        f"({'largest model at a time, --prune' if prune else 'every model kept, no --prune'}). "
+        + ("Point --scratch at a roomier drive" if prune else
+           "Add --prune, point --scratch at a roomier drive,")
+        + " or pass --ignore-space if the estimate is wrong (it is derived from approx_size_gb "
+          "and good to about 10%)."
+    )
+
+
+
 def convert_one(
     model_key: str,
     ctx: SetupContext,
@@ -448,6 +551,7 @@ def convert_one(
     *,
     quantize_binary: Path,
     llama_tree: Path,
+    converter_env: Mapping[str, Any] | None = None,
 ) -> ConversionRecord:
     meta = resolve_model(model_key)
     plan = plan_conversion(model_key, meta, outtype=args.outtype)
@@ -467,7 +571,7 @@ def convert_one(
 
     f16 = convert_to_gguf(
         plan, source, gguf_dir / f"{model_key}-{plan.outtype.upper()}.gguf",
-        llama_tree=llama_tree, remote=args.remote,
+        llama_tree=llama_tree, python=args.python, remote=args.remote,
     )
 
     if args.prune and not args.remote and source_dir.exists():
@@ -504,6 +608,7 @@ def convert_one(
         f16_path=f16 if keep_f16 else None,
         elapsed_s=time.perf_counter() - started,
         notes=notes,
+        converter_env=dict(converter_env or {}),
     )
 
     if args.prune and not keep_f16 and f16 != final and f16.exists():
@@ -526,6 +631,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--outtype", default="f16", choices=["f16", "bf16", "f32"],
                         help="intermediate precision; MXFP4 sources ignore it (default: f16)")
     parser.add_argument("--scratch", type=Path, default=None)
+    parser.add_argument("--python", default=sys.executable,
+                        help="interpreter that runs convert_hf_to_gguf.py; needs the converter's "
+                             "own requirements (default: this one, which is right on Kaggle)")
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 4))
     parser.add_argument("--remote", action="store_true",
                         help="stream safetensors from the Hub instead of downloading them")
@@ -538,6 +646,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="record the result in configs/models.yaml")
     parser.add_argument("--force", action="store_true",
                         help="with --write, overwrite a DIFFERENT recorded gguf block")
+    parser.add_argument("--ignore-space", action="store_true",
+                        help="run even if the scratch drive looks too small")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the recipe table and exit; downloads nothing")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -586,6 +696,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _say(f"commit  : {ctx.llama_commit[:12]}")
     _say(f"hf token: {'set' if ctx.hf_token_present else 'UNSET (gated repos will 401)'}")
 
+    complaint = check_space(keys, scratch, remote=args.remote, prune=args.prune)
+    if complaint:
+        _say(f"\n{'IGNORED: ' if args.ignore_space else 'NOT ENOUGH DISK: '}{complaint}")
+        if not args.ignore_space:
+            return 2
+
     try:
         for step in (step_env, step_deps, step_llama):
             _say(f"\n== {step.__name__.replace('step_', '')}")
@@ -617,11 +733,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         llama_tree = find_llama_tree(ctx)
         _say(f"\nconverter: {llama_tree / 'convert_hf_to_gguf.py'}")
+        _say(f"python   : {args.python}")
+
+        converter_env = probe_converter_env(args.python)
+        _say(f"           transformers {converter_env.get('transformers')}, "
+             f"torch {converter_env.get('torch')}, gguf {converter_env.get('gguf')}")
 
         records: list[ConversionRecord] = []
         for key in keys:
             records.append(convert_one(key, ctx, args, quantize_binary=quantize_binary,
-                                       llama_tree=llama_tree))
+                                       llama_tree=llama_tree, converter_env=converter_env))
 
         if args.write:
             _say("\n== recording in configs/models.yaml")

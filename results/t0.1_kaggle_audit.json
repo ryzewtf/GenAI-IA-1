@@ -1,0 +1,53 @@
+{
+  "task": "T0.1",
+  "generated": "2026-08-18T08:39:00Z",
+  "source": "src/runtime/diagnose.py, run in a Kaggle interactive session",
+  "host": {
+    "platform": "Linux-6.12.90+-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu_usable": 4,
+    "cpu_total": 4,
+    "ram_total_gib": 31.3,
+    "ram_available_gib": 30.0,
+    "cgroup_limit_gib": 30.0
+  },
+  "gpu": {
+    "n_devices": 2,
+    "name": "Tesla T4",
+    "compute_cap": "7.5",
+    "vram_mib": 15360,
+    "driver": "580.159.04",
+    "ecc": "Disabled",
+    "compute_mode": "Default"
+  },
+  "storage": {
+    "/kaggle/working": {"free_gib": 19.5, "total_gib": 19.5, "files": 0, "note": "output commit caps at ~500 files (I9)"},
+    "/kaggle/input": {"free_gib": 19.5, "total_gib": 19.5, "datasets_attached": []},
+    "/tmp": {"free_gib": 1026.8, "total_gib": 8062.4},
+    "/kaggle/temp": {"present": false, "note": "ABSENT from this image; was configs/run.yaml unhashed.paths.scratch before T0.1"}
+  },
+  "write_throughput_mbps": {"/kaggle/working": 206.5, "/tmp": 193.0, "probe": "256 MiB, fsynced"},
+  "toolchain": {"nvcc": "12.8.93", "cmake": "3.31.10", "ninja": "1.13.0", "gcc": "11.4.0", "gpp": "11.4.0", "git": "2.34.1", "hf": "1.11.0", "cuda_home": "/usr/local/cuda"},
+  "packages": {
+    "numpy": "2.0.2", "scipy": "1.16.3", "yaml": "6.0.3", "pytest": "8.4.2",
+    "torch": "2.10.0+cu128", "transformers": "5.0.0", "huggingface_hub": "1.11.0",
+    "safetensors": "0.7.0", "gguf": null, "triton": "3.6.0", "psutil": "5.9.5",
+    "kernels": "not probed by the version of diagnose.py that produced this report",
+    "pip": "24.1.2"
+  },
+  "network": {"github.com_ms": 65, "huggingface.co_ms": 56, "pypi.org_ms": 13},
+  "env": {"HF_TOKEN": "unset", "HUGGINGFACE_HUB_TOKEN": "unset", "KAGGLE_KERNEL_RUN_TYPE": "Interactive"},
+  "config_changes": [
+    "unhashed.paths.scratch: /kaggle/temp -> /tmp/moe (the configured mount does not exist)",
+    "unhashed.preflight.min_free_gb: added, 100 GB, so the 2 GB probe cannot pass on the 19.5 GiB overlay",
+    "hashed.platform.gpu_arch=75 and n_devices=2 CONFIRMED against measurement (were already correct)",
+    "hashed.inference.n_threads=4 CONFIRMED against 4 usable vCPU",
+    "hashed.build.cuda_architectures='75' CONFIRMED against compute cap 7.5"
+  ],
+  "unblocked": ["T3.2 (torch 2.10 + transformers 5.0 + accelerate present)"],
+  "open": [
+    "kernels package presence -- decides T3.2's GPT-OSS path (plan C11); re-run diagnose to answer",
+    "HF_TOKEN must be attached as a Kaggle Secret before any collection (upload backend is hf)",
+    "transformers is 5.0.0, a major bump; plan C11's claim about quantizer_mxfp4.py gating at >= (7, 5) was read against 4.x"
+  ]
+}
