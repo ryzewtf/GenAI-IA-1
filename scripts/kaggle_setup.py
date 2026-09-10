@@ -428,7 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _say(f"      --gguf {gguf_path} \\")
     _say(f"      --spec {spec_path} \\")
     _say(f"      --binary {binary} \\")
-    _say("      --corpus corpora/mixed_v1.jsonl")
+    _say("      --corpus <corpus jsonl>   # e.g. /kaggle/input/moe-corpus/mixed-v1.jsonl")
     _say("=" * 78)
     return 0
 

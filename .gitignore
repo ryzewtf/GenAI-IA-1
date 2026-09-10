@@ -3,7 +3,11 @@
 *.safetensors
 *.bin
 !**/tests/**/*.bin
-traces/
+# Trace OUTPUT only. Anchored to the repo root so it cannot swallow the src/traces source package
+# (an unanchored `traces/` matched `src/traces/`, so the collector's own code never got committed
+# and Kaggle's clone could not import it).
+/traces/
+!src/traces/
 scratch/
 models/
 corpora/*.jsonl
