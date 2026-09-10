@@ -126,6 +126,41 @@ class SetupContext:
     def models_dir(self) -> Path:
         return self.scratch / "models"
 
+    @property
+    def cuda_toolkit_root(self) -> str:
+        """The CUDA toolkit root, from the environment the image sets, else the conventional path.
+        Passed as CUDAToolkit_ROOT so FindCUDAToolkit searches the toolkit we actually built nvcc
+        from rather than guessing among several."""
+        return os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
+
+    @property
+    def cuda_driver_lib_dir(self) -> str:
+        """Directory holding a linkable `libcuda.so`, put on CMAKE_LIBRARY_PATH so FindCUDAToolkit
+        can DEFINE the CUDA::cuda_driver imported target that ggml-cuda links (see step_build).
+
+        The Kaggle CUDA 12.8 image ships NO toolkit driver stub (`<root>/.../stubs/libcuda.so` is
+        absent) and no `libcuda.so` on the default linker path, so FindCUDAToolkit cannot create the
+        target and configure fails at generate time -- before any GPU work. The real driver library
+        IS on the image, just in dirs the linker does not search by default: `/usr/local/nvidia/lib64`
+        (the loaded driver) and `/usr/local/cuda/compat` (the compat driver), each with a proper
+        `libcuda.so` dev symlink. Probe the known locations and return the first that has one; prefer
+        the loaded driver over the compat build. Verified on the image: adding this dir makes the
+        configure that otherwise errors with 'CUDA::cuda_driver ... target was not found' succeed.
+
+        POSIX strings, not Path arithmetic: these are Linux image paths (the build runs on Kaggle);
+        Path on a Windows generator/test host would join them with backslashes."""
+        root = self.cuda_toolkit_root.rstrip("/")
+        candidates = [
+            "/usr/local/nvidia/lib64",              # the loaded driver (matches diagnose)
+            f"{root}/compat",                        # CUDA 12.x forward-compat driver
+            f"{root}/targets/x86_64-linux/lib/stubs",  # toolkit stub, if a future image ships one
+            f"{root}/lib64/stubs",
+        ]
+        for d in candidates:
+            if os.path.exists(f"{d}/libcuda.so"):
+                return d
+        return candidates[0]
+
 
 # -- helpers -----------------------------------------------------------------------------------
 
@@ -428,7 +463,18 @@ def step_build(ctx: SetupContext, *, targets: Sequence[str] = ("moe_trace",)) ->
             f"-DLLAMA_CPP_DIR={ctx.llama_dir}",
             # A CPU session has no CUDA Toolkit, so ON is not a harmless over-request: ggml-cuda's
             # CMakeLists raises "CUDA Toolkit not found" and configure stops.
-            *(["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={ctx.cuda_arch}"]
+            #
+            # CUDAToolkit_ROOT + a dir holding libcuda.so on CMAKE_LIBRARY_PATH: on the Kaggle CUDA
+            # 12.8 image FindCUDAToolkit finds nvcc and the headers but fails to DEFINE the
+            # CUDA::cuda_driver imported target that ggml-cuda/CMakeLists.txt links, because there is
+            # no toolkit driver stub and no libcuda.so on the default linker path. The target is only
+            # created when the library is found, so configure fails at generate, before any GPU work.
+            # The real driver library is on the image under a dir the linker does not search by
+            # default; cuda_driver_lib_dir finds it. Verified on the image: this turns the failing
+            # configure into rc 0.
+            *(["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={ctx.cuda_arch}",
+               f"-DCUDAToolkit_ROOT={ctx.cuda_toolkit_root}",
+               f"-DCMAKE_LIBRARY_PATH={ctx.cuda_driver_lib_dir}"]
               if ctx.cuda else ["-DGGML_CUDA=OFF"]),
             # Mandatory, see the module docstring: a native build breaks T3.6 across sessions.
             "-DGGML_NATIVE=OFF",
