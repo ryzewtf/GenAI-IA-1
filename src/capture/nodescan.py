@@ -508,7 +508,11 @@ def set_model_fields(models_path: Path | str, model_key: str,
     (invariant I13) is not. ``force`` exists for the deliberate case and says so in the diff.
     """
     path = Path(models_path)
-    raw = path.read_text(encoding="utf-8", newline="")
+    # Read bytes and decode rather than Path.read_text(newline=""): the newline kwarg on read_text
+    # only exists in Python 3.13+, and Kaggle runs 3.12 (a scan there crashed with TypeError). We
+    # need NO newline translation so the original CRLF/LF style can be detected and preserved
+    # below; decoding raw bytes does exactly that on every version.
+    raw = path.read_bytes().decode("utf-8")
     newline = "\r\n" if "\r\n" in raw else "\n"
     lines = raw.replace("\r\n", "\n").split("\n")
 
@@ -582,7 +586,10 @@ def set_model_fields(models_path: Path | str, model_key: str,
         changes.append(f"{key}: {current or '(empty)'} -> {value}")
 
     if changes:
-        path.write_text(newline.join(lines), encoding="utf-8", newline="")
+        # Write bytes rather than write_text(newline=""): the kwarg is 3.13+, and Kaggle is 3.12.
+        # `lines` already carries the file's original newline style (joined with `newline`), so we
+        # must write it verbatim with no further translation -- encoding to bytes does exactly that.
+        path.write_bytes(newline.join(lines).encode("utf-8"))
     return changes
 
 
