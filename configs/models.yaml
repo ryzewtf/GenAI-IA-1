@@ -231,7 +231,7 @@ models:
   qwen3-30b-a3b:
     hf_repo: Qwen/Qwen3-30B-A3B
     revision: null
-    checkpoint_status: null              # T1.1 / O5 — default `-it`
+    checkpoint_status: instruct          # T1.1 / O5 — default `-it` is the instruction-tuned checkpoint
     role: [pair_t, primary]
     n_experts: 128                       # VERIFIED §1.4
     top_k: 8                             # VERIFIED §1.4
@@ -263,7 +263,7 @@ models:
     license: apache-2.0
     sliding_window: 1024                 # attention only; irrelevant to routing capture at -c 2048
     revision: null
-    checkpoint_status: null              # T1.1 / O5 — default `-it` (no base GGUF is published)
+    checkpoint_status: instruct          # T1.1 / O5 — default `-it` is the instruction-tuned checkpoint (no base GGUF is published)
     role: [pair_t, primary, shared_expert_panel]
     n_experts: 128                       # VERIFIED §1.4
     top_k: 8                             # VERIFIED §1.4
