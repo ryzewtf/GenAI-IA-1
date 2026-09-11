@@ -1131,4 +1131,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    import os
+    import sys
+
+    # HFDatasetSource(streaming=True) leaves daemon prefetch threads alive after main() returns: at
+    # least one is typically mid-request (an in-flight parquet fetch, retrying on a dropped socket).
+    # During normal interpreter finalization that thread calls back into Python with no valid
+    # thread-state and aborts with `Fatal Python error: PyGILState_Release` (SIGABRT, exit -6) -- AFTER
+    # the corpus has already been written and "wrote ..." printed. The non-zero exit then makes the
+    # Kaggle cell report FAILED and blocks build/publish, for a crash that changed nothing on disk.
+    # os._exit skips finalization entirely so the daemon thread never runs the teardown that crashes;
+    # flush first because os._exit also skips buffer flushing, and the "wrote ..."/report lines must
+    # reach the log.
+    _rc = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_rc)
