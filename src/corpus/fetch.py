@@ -49,7 +49,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
-from .build import CharRatioCounter, Document, TokenCounter, build, realized_shares, write_corpus
+from .build import (
+    CharRatioCounter,
+    Document,
+    TokenCounter,
+    Utf8ByteCounter,
+    build,
+    realized_shares,
+    write_corpus,
+)
 from .spec import DOMAINS, MIXED_V1, MIXED_V1_SCALE, CorpusSpec, SourceSpec
 
 __all__ = [
@@ -855,6 +863,11 @@ def fetch_corpus(
     yields devtest in its canonical order per language, which is true of a streamed HF split.
     """
     counter = counter or CharRatioCounter()
+    # The I15 guarantee is enforced by BYTES, not by the reference counter: real_tokens <= bytes for
+    # every panel tokenizer, so a byte cap below n_ctx is the only thing that stops moe_trace
+    # truncating a document at capture (which rejects the whole shard). See Utf8ByteCounter /
+    # spec.max_doc_bytes. Instantiated once; it is stateless.
+    byte_counter = Utf8ByteCounter()
     readers = _resolve_sources(spec, sources)
     by_name = {s.name: s for s in spec.sources}
     base_targets = spec.source_token_targets()
@@ -907,7 +920,14 @@ def fetch_corpus(
         if not text:
             report.dropped["empty_after_normalise"] += 1
             return None, 0, "empty_after_normalise"
-        text, was_truncated = truncate_to_tokens(text, counter, spec.max_doc_tokens)
+        # Byte cap FIRST -- this is the I15 guarantee (real_tokens <= bytes < n_ctx for every model).
+        # The reference-token cap that follows only shapes the shared budget and, at max_doc_bytes
+        # below n_ctx, never actually fires; it is kept so the invariant holds even if the two caps
+        # are ever reconfigured. Both truncations pull back to a word/line boundary (see
+        # truncate_to_tokens), and each only shortens, so the byte bound survives the second cut.
+        text, truncated_bytes = truncate_to_tokens(text, byte_counter, spec.max_doc_bytes)
+        text, truncated_ref = truncate_to_tokens(text, counter, spec.max_doc_tokens)
+        was_truncated = truncated_bytes or truncated_ref
         reason = within_length_bounds(
             text, counter, min_tokens=min_doc_tokens, max_tokens=spec.max_doc_tokens
         )

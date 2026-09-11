@@ -40,6 +40,12 @@ __all__ = [
     "MIXED_V1_SCALE",
 ]
 
+# The pinned context length (plan I4, configs/run.yaml inference.ctx_size). Hardcoded here rather
+# than read from run.yaml because spec.py is a pure, hashable declaration with no runtime deps -- and
+# because the byte cap's whole reason for existing is this exact number. If I4's n_ctx ever changes,
+# this and configs/run.yaml move together.
+N_CTX: int = 2048
+
 DOMAINS: tuple[str, ...] = ("prose", "code", "math", "multilingual")
 
 TARGET_SHARES: dict[str, float] = {
@@ -150,7 +156,19 @@ class CorpusSpec:
     name: str
     target_tokens: int
     max_doc_tokens: int = 2048
-    """Plan T4.2 / I4. Equal to the pinned n_ctx: a longer document would be truncated at capture."""
+    """Plan T4.2 / I4. The *reference*-counter (char-ratio) cap, for the shared token budget only.
+    It does NOT bound the real token count at capture -- see :attr:`max_doc_bytes`, which does."""
+    max_doc_bytes: int = 1900
+    """The I15 truncation guarantee. ``moe_trace`` tokenizes each document with the model's real
+    tokenizer and truncates -- failing the shard -- any document exceeding the pinned n_ctx (2048).
+    The reference cap (:attr:`max_doc_tokens`) cannot prevent that: the panel's tokenizers span 50k
+    to 262k vocab, so 4.0 chars/token is unrelated to any of them, and a doc at the reference cap
+    overflows n_ctx for the byte-fallback checkpoints (measured: a 1280-reference-token CJK doc hit
+    ~3900 real tokens under OLMoE). UTF-8 byte count is the only tokenizer-independent upper bound:
+    the byte-level-BPE models (OLMoE/Qwen3/DeepSeek/GPT-OSS) emit at most one token per input byte,
+    and Gemma 4's 262k SPM never approaches the cap. 1900 bytes < n_ctx=2048 leaves ~148 tokens of
+    headroom for the added BOS. Enforced by :mod:`src.corpus.fetch` via :class:`Utf8ByteCounter`.
+    Raising this toward or past n_ctx re-opens I15; lowering it only shortens documents."""
     shard_tokens: int = 50_000
     """Plan T4.2. Shards never straddle a document, so this is a target, not an exact size."""
     split_ratios: Mapping[str, float] = field(
@@ -170,6 +188,17 @@ class CorpusSpec:
             raise CorpusSpecError(
                 f"shard_tokens ({self.shard_tokens}) must be at least max_doc_tokens "
                 f"({self.max_doc_tokens}); shards must be able to hold a whole document"
+            )
+        if self.max_doc_bytes <= 0:
+            raise CorpusSpecError("max_doc_bytes must be positive")
+        if self.max_doc_bytes >= N_CTX:
+            # The whole point of the byte cap is to sit BELOW n_ctx so real tokenization cannot
+            # overflow it (real_tokens <= bytes for the panel's tokenizers). A cap at or above n_ctx
+            # is the I15 bug it exists to prevent -- see max_doc_bytes' docstring.
+            raise CorpusSpecError(
+                f"max_doc_bytes ({self.max_doc_bytes}) must be below the pinned n_ctx ({N_CTX}): "
+                "real tokens <= bytes, and a document must fit n_ctx tokens under every tokenizer "
+                "or moe_trace truncates it and I15 rejects the shard"
             )
 
         total = sum(self.shares.values())
@@ -256,23 +285,21 @@ class CorpusSpec:
         return path
 
 
-# max_doc_tokens is 1280, deliberately below the pinned n_ctx of 2048, NOT equal to it. The cap is
-# enforced with the char-ratio reference counter (4.0 chars/token) so that one shared corpus can have
-# one shared token count across all seven checkpoints (T4.3). But real tokenizers fragment further
-# than 4 chars/token on the non-Latin (CulturaX) and symbol-dense (code/math) tail: a doc at 2048
-# reference tokens measured ~2668 real tokens under OLMoE (~3.07 real chars/token worst case), so it
-# was truncated at capture and I15 (zero-tolerance) rejected the shard. 1280 ref tokens = 5120 chars,
-# which stays under 2048 real tokens even at ~2.5 chars/token, giving margin for every panel
-# vocabulary. Lowering this is the ONLY correct lever: a real-tokenizer count cannot go into the
-# shared file without breaking T4.3's identical-shards requirement. Changing it requires a corpus
-# rebuild + republish.
-MIXED_V1 = CorpusSpec(name="mixed-v1", target_tokens=1_000_000, max_doc_tokens=1280)
+# The I15 truncation guarantee lives in max_doc_bytes (default 1900, below n_ctx), NOT in
+# max_doc_tokens. An earlier attempt lowered max_doc_tokens (2048 -> 1280) to try to keep real
+# tokenization under n_ctx, but that cannot work: max_doc_tokens is counted with the char-ratio
+# reference proxy (4.0 chars/token), which is unrelated to any of the panel's real tokenizers, so a
+# document at ANY reference cap can still overflow n_ctx for the byte-fallback checkpoints (a
+# 1280-reference-token CJK doc measured ~3900 real tokens under OLMoE). The byte cap is the fix
+# because real_tokens <= bytes for every tokenizer here; max_doc_tokens is back to n_ctx and shapes
+# only the shared reference budget (T4.3). Changing max_doc_bytes requires a corpus rebuild +
+# republish.
+MIXED_V1 = CorpusSpec(name="mixed-v1", target_tokens=1_000_000)
 """The main corpus, all seven checkpoints. 500k if gate Q1 fires (T0.5)."""
 
 MIXED_V1_SCALE = CorpusSpec(
     name="mixed-v1-scale",
     target_tokens=4_000_000,
-    max_doc_tokens=1280,
     models=("olmoe-0125",),
     seed=1,
 )

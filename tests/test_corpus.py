@@ -18,6 +18,7 @@ from src.corpus.build import (
     BuildResult,
     CharRatioCounter,
     Document,
+    Utf8ByteCounter,
     assign_shards,
     assign_splits,
     build,
@@ -29,25 +30,63 @@ from src.corpus.build import (
     shard_table,
     write_corpus,
 )
-from src.corpus.spec import MIXED_V1, MIXED_V1_SCALE, CorpusSpec, CorpusSpecError
+from src.corpus.spec import N_CTX, MIXED_V1, MIXED_V1_SCALE, CorpusSpec, CorpusSpecError
 
 COUNTER = CharRatioCounter()
 
 
-def test_shipped_specs_cap_docs_below_n_ctx_so_real_tokenization_cannot_overflow():
-    """I15 is zero-tolerance: a doc truncated at capture rejects the whole shard. The cap is counted
-    with the char-ratio proxy (4.0 chars/token) but capture uses each model's real tokenizer, which
-    fragments further on non-Latin/code -- a doc at 2048 reference tokens measured ~2668 real under
-    OLMoE. So the shared cap must sit BELOW the pinned n_ctx (2048) with margin, not at it. Pin that
-    here so it is not quietly raised back to n_ctx."""
-    N_CTX = 2048
+def test_shipped_specs_cap_docs_by_bytes_so_real_tokenization_cannot_overflow_n_ctx():
+    """I15 is zero-tolerance: a doc truncated at capture rejects the whole shard. moe_trace tokenizes
+    with each model's REAL tokenizer, so the char-ratio reference cap (max_doc_tokens) cannot bound
+    it -- 4.0 chars/token is unrelated to a 50k..262k-vocab tokenizer, and a doc at the reference cap
+    overflows n_ctx for the byte-fallback checkpoints. The guarantee lives in max_doc_bytes: the
+    byte-level-BPE models emit <= 1 token per input byte, so bytes < n_ctx bounds real tokens under
+    every model. Pin that here so max_doc_bytes cannot be quietly raised to (or past) n_ctx."""
     for spec in (MIXED_V1, MIXED_V1_SCALE):
-        assert spec.max_doc_tokens <= 1280, spec.name
-        # The cap in chars is max_doc_tokens * 4.0 (the reference proxy). OLMoE's observed worst was
-        # ~3.07 real chars/token; check a stricter 2.7 (heavier fragmentation headroom) still lands
-        # under n_ctx real tokens. At 1280: 5120 chars / 2.7 ~= 1896 < 2048.
-        worst_real_tokens = (spec.max_doc_tokens * 4.0) / 2.7
-        assert worst_real_tokens < N_CTX, (spec.name, worst_real_tokens)
+        # real_tokens <= bytes for the panel tokenizers, plus a BOS from add_special=true; the cap
+        # must clear n_ctx with room for that. 1900 leaves 148 tokens of headroom.
+        assert spec.max_doc_bytes < N_CTX, (spec.name, spec.max_doc_bytes)
+        assert N_CTX - spec.max_doc_bytes >= 128, (spec.name, spec.max_doc_bytes)
+
+
+def test_byte_counter_bounds_char_ratio_and_is_never_zero():
+    """Utf8ByteCounter is the I15 lever. It must upper-bound the character count (so a cap in bytes
+    is at least as tight as the same number in chars) and never return zero (moe_trace treats a
+    zero-token doc as fatal)."""
+    counter = Utf8ByteCounter()
+    assert counter.count("") == 1
+    assert counter.count("abc") == 3
+    # Non-Latin: one CJK char is 3 UTF-8 bytes, which is exactly where the char-ratio proxy
+    # under-counts and the real tokenizer over-fragments.
+    assert counter.count("中文") == 6
+    for text in ("plain ascii", "café", "日本語テキスト", "🙂 emoji"):
+        assert counter.count(text) >= len(text)
+
+
+def test_byte_capped_specs_still_build_and_leave_docs_under_the_byte_cap():
+    """End to end: a spec at the shipped byte cap truncates over-long documents to <= max_doc_bytes,
+    and the built corpus contains no document whose UTF-8 length exceeds it -- the property moe_trace
+    relies on to never truncate at capture."""
+    from src.corpus.fetch import InMemorySource, fetch_corpus
+
+    cap = 200
+    long_ascii = "word " * 400          # ~2000 bytes, well over the cap
+    long_cjk = "中文字符" * 300          # far over the cap in bytes
+    sources = InMemorySource(
+        texts={
+            "fineweb-edu": [long_ascii] * 20,
+            "starcoderdata": ["def f():\n    return 1\n" * 100] * 20,
+            "open-web-math": ["\\int_0^1 x^2 dx = 1/3. " * 100] * 20,
+            "culturax": {l: [long_cjk] * 10 for l in ("de", "fr", "es", "ru", "zh", "ja", "ar", "hi")},
+            "flores200": {l: ["parallel sentence."] * 5 for l in
+                          ("de", "fr", "es", "ru", "zh", "ja", "ar", "hi")},
+        }
+    )
+    spec = replace(MIXED_V1, target_tokens=5_000, max_doc_bytes=cap)
+    result = fetch_corpus(spec, sources, warn=False)
+    assert result.docs, "fixture should have produced documents"
+    for doc in result.docs:
+        assert len(doc.text.encode("utf-8")) <= cap, (doc.doc_id, doc.source)
 
 # (domain, lang, n_docs, chars_per_doc) -- multilingual is split over languages so there are small
 # strata (hi with 4 docs) as well as large ones, which is where the rounding rule shows.

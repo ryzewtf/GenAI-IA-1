@@ -54,6 +54,7 @@ __all__ = [
     "FALLBACK_LADDER",
     "TokenCounter",
     "CharRatioCounter",
+    "Utf8ByteCounter",
     "Document",
     "BuildResult",
     "assign_splits",
@@ -110,6 +111,32 @@ class CharRatioCounter:
         # max(1, ...) because a document that counts as zero tokens would be invisible to the
         # budget and to sharding, but moe_trace treats a zero-token document as a hard error.
         return max(1, math.ceil(len(text) / self.chars_per_token))
+
+
+@dataclass(frozen=True)
+class Utf8ByteCounter:
+    """A :class:`TokenCounter` that returns the UTF-8 byte length -- a *guaranteed upper bound* on
+    the real token count for every tokenizer in the panel.
+
+    This is NOT a token estimate and never goes into the corpus file (that is
+    :class:`CharRatioCounter`'s job, T4.3). It exists for one thing: the I15 truncation guarantee.
+    ``moe_trace`` tokenizes each document with the model's real tokenizer and truncates any document
+    whose token count exceeds the pinned ``n_ctx`` (2048), which fails the shard. The reference
+    proxy (4.0 chars/token) cannot bound that: a document at 1280 *reference* tokens (5120 chars) of
+    mixed CJK measured ~3900 *real* tokens under OLMoE, and a pure-CJK document under a 50k-vocab
+    byte-fallback tokenizer approaches one token per byte -- no shared char-ratio cap is safe.
+
+    Byte count is safe because the binding models (OLMoE, Qwen3, DeepSeek-V2, GPT-OSS) are byte-level
+    BPE: every token maps to at least one input byte, so ``real_tokens <= byte_count`` exactly, with
+    no normalisation expansion. Gemma 4 (262k SPM) is the least-fragmenting model and never
+    approaches the cap. So capping a document's UTF-8 bytes below ``n_ctx`` (with margin for the
+    added BOS) bounds its real token count under all seven checkpoints -- the only lever that can.
+    """
+
+    def count(self, text: str) -> int:
+        # max(1, ...) mirrors CharRatioCounter: a zero-length document is a hard error in moe_trace,
+        # so it must never be counted as zero here either.
+        return max(1, len(text.encode("utf-8")))
 
 
 @dataclass
