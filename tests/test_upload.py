@@ -111,6 +111,31 @@ class FlakyBackend(LocalDirBackend):
         super().upload_file(local_path, remote_path)
 
 
+class CommitCountingBackend(LocalDirBackend):
+    """Counts commits (upload_files calls) and how many files each carried. Models HF's one-commit-
+    per-upload_file / 128-commits-per-hour cap: the whole point of batching is that a shard costs one
+    commit, not one per stream file."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.commits: list[int] = []
+
+    def upload_files(self, uploads):
+        self.commits.append(len(uploads))
+        super().upload_files(uploads)
+
+
+def test_a_shard_uploads_in_a_single_batched_commit_not_one_per_file(tmp_path, shard):
+    """HF caps commits at 128/hour and a per-file upload is one commit each, so a model's ~21 shards
+    times ~5 streams 429s mid-run. upload_shard must hand the whole shard to the backend as ONE
+    batch (one commit) covering every stream file plus the manifest."""
+    backend = CommitCountingBackend(tmp_path / "remote")
+    result = upload_shard(shard, backend, remote_prefix=REMOTE_PREFIX)
+    assert result.verified
+    assert len(backend.commits) == 1, backend.commits          # exactly one commit for the shard
+    assert backend.commits[0] >= 2, backend.commits            # streams + manifest, all in it
+
+
 # -- sha256_file ------------------------------------------------------------------------------
 
 

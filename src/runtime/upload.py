@@ -117,7 +117,15 @@ class StorageBackend(Protocol):
     def upload_file(self, local_path: Path, remote_path: str) -> None:
         """Store ``local_path`` at ``remote_path``, overwriting."""
 
-    def download_file(self, remote_path: str, dest_path: Path) -> Path:
+    def upload_files(self, uploads: "list[tuple[Path, str]]") -> None:
+        """Store several ``(local_path, remote_path)`` pairs, overwriting, ideally atomically.
+
+        Optional: :func:`upload_shard` uses it when present and falls back to :meth:`upload_file`
+        per file otherwise. It exists because a per-file upload to an HF dataset repo is one *commit*
+        each, and HF caps commits at 128/hour -- a single model's ~21 shards times ~5 stream files is
+        already ~105 commits, so one commit per shard (this method) is the difference between a run
+        that finishes and a 429. A filesystem backend has no commits, so its per-file default is fine.
+        """
         """Fetch ``remote_path`` to ``dest_path`` and return the path actually written."""
 
     def exists(self, remote_path: str) -> bool:
@@ -150,6 +158,12 @@ class LocalDirBackend:
         target = self._resolve(remote_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, target)
+
+    def upload_files(self, uploads: list[tuple[Path, str]]) -> None:
+        # No commits on a filesystem, so batching buys nothing here -- but implementing it keeps the
+        # production code path (upload_shard's batch branch) exercised by the offline tests.
+        for local_path, remote_path in uploads:
+            self.upload_file(local_path, remote_path)
 
     def download_file(self, remote_path: str, dest_path: Path) -> Path:
         source = self._resolve(remote_path)
@@ -249,6 +263,35 @@ class HFBackend:
             raise
         except Exception as exc:  # hub raises a wide family; the caller only needs the path
             raise UploadError(f"upload of {remote_path} to {self.repo_id} failed: {exc}") from exc
+
+    def upload_files(self, uploads: list[tuple[Path, str]]) -> None:
+        """One commit for the whole batch. This is the rate-limit fix: HF caps commits at 128/hour,
+        and uploading a shard's ~5 stream files as five separate ``upload_file`` calls is five
+        commits, so a single model's shards exhaust the budget mid-run with a 429. ``create_commit``
+        with one :class:`CommitOperationAdd` per file lands them all in a single commit -- and
+        atomically, which is strictly stronger than the old manifest-last ordering (the manifest is
+        present on the Hub iff every stream beside it is)."""
+        if not uploads:
+            return
+        api = self._client()
+        hub = self._hub()
+        operations = [
+            hub.CommitOperationAdd(path_in_repo=remote_path, path_or_fileobj=str(local_path))
+            for local_path, remote_path in uploads
+        ]
+        try:
+            api.create_commit(
+                repo_id=self.repo_id,
+                repo_type=self.repo_type,
+                operations=operations,
+                commit_message=f"upload {len(operations)} trace file(s)",
+            )
+        except UploadError:
+            raise
+        except Exception as exc:  # hub raises a wide family; name the batch, not one path
+            raise UploadError(
+                f"batch upload of {len(operations)} file(s) to {self.repo_id} failed: {exc}"
+            ) from exc
 
     def download_file(self, remote_path: str, dest_path: Path) -> Path:
         api = self._client()
@@ -473,10 +516,20 @@ def upload_shard(
         path = shard_dir / name
         result.files[name] = {"size": path.stat().st_size, "sha256": sha256_file(path)}
 
-    # 2. upload. The manifest goes last: a reader that finds a manifest can then assume the
-    #    streams beside it were at least fully transmitted once.
+    # 2. upload. Prefer a single batched commit for the whole shard (backend.upload_files): an HF
+    #    dataset repo commits once per upload_file call and caps commits at 128/hour, so a per-file
+    #    upload burns ~5 commits/shard and a single model's ~21 shards 429s mid-run. A batch commit is
+    #    one commit for the shard AND atomic, which is stronger than the old manifest-last ordering
+    #    (a reader sees the manifest only when every stream beside it is already there). Backends that
+    #    implement only upload_file (a minimal mock) still work via the per-file fallback.
+    uploads = [(shard_dir / name, _remote_path(result.remote_prefix, name)) for name in names]
+    batch = getattr(backend, "upload_files", None)
+    if callable(batch):
+        batch(uploads)
+    else:
+        for local_path, remote_path in uploads:
+            backend.upload_file(local_path, remote_path)
     for name in names:
-        backend.upload_file(shard_dir / name, _remote_path(result.remote_prefix, name))
         result.bytes_uploaded += int(result.files[name]["size"])
 
     # 3. verify, into a scratch dir that is removed whether or not verification passes.
