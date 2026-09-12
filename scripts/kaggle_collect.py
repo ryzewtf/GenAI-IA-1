@@ -206,6 +206,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if config.inference.get("disable_cuda_fusion", True):
         os.environ["GGML_CUDA_DISABLE_FUSION"] = "1"
 
+    # GGML_CUDA_PDL=0 disables Programmatic Dependent Launch. At the pinned llama.cpp commit the
+    # PDL launch path is compiled in and gated only on `#if defined(GGML_CUDA_USE_PDL)` with NO
+    # host-side architecture guard, so on Turing/sm_75 (Kaggle T4) it attempts programmatic stream
+    # serialization -- a Hopper/sm_90 feature -- and faults with "illegal memory access", surfacing
+    # at ggml_cuda_kernel_can_use_pdl. It is per-kernel and cached, so it triggers only for the
+    # specific kernels a given model's token shapes exercise: olmoe collected clean, qwen3 dies on
+    # shard 10. This is a LAUNCH-MECHANISM switch, not a numeric one -- the kernel computes the same
+    # bytes either way -- so it is deliberately NOT in run.yaml's hashed block: it does not change
+    # run_config_sha256, and shards collected with it stay byte-mergeable with shards collected
+    # without it (qwen3 0-9, both olmoe). Unconditional because every T4 capture needs it.
+    os.environ["GGML_CUDA_PDL"] = "0"
+
     runner_argv = [
         "--model", args.model,
         "--model-path", str(gguf),
