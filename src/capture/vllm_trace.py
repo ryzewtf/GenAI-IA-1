@@ -394,9 +394,18 @@ class RouterCapture:
     * raw router logits (logits.bin, after :class:`GatingOp`) — ``forward_hook`` on ``.gate``:
       its output.
     * vLLM's OWN expert selection (topk.bin, and the faithfulness gate's independent side) —
-      a wrapper around each experts module's ``select_experts``, capturing the returned
-      ``topk_ids``. This is what makes the gate a real test rather than a tautology: topk comes
-      from vLLM's kernel path, not from our recomputation of the same logits.
+      a wrapper around ``FusedMoE.select_experts``, capturing the returned ``topk_ids``. This is
+      what makes the gate a real test rather than a tautology: topk comes from vLLM's kernel path,
+      not from our recomputation of the same logits.
+
+    ``select_experts`` is a **staticmethod** that vLLM invokes as ``FusedMoE.select_experts(...)``
+    through the CLASS (from ``UnquantizedFusedMoEMethod.forward_cuda`` and the quantized methods'
+    apply), never as ``self.select_experts(...)`` — so it must be wrapped on the class object, not
+    on an instance (an instance attribute is simply bypassed and captures nothing). The wrapper
+    records each call's ``topk_ids`` in CALL ORDER; for a single-document prefill the MoE layers run
+    sequentially, so the k-th call is layer k. That alignment is not taken on faith: the per-layer
+    :meth:`DocumentTrace.put_layer` gate recomputes top-k from layer L's own logits and compares it
+    to the k-th captured selection, so any order skew surfaces as :class:`SelectionMismatch`.
 
     ``experts_modules`` is optional. Without it, only inputs/outputs are captured and the caller
     must supply the comparison topk some other way (e.g. the TP>1 routed-experts capturer).
@@ -417,11 +426,21 @@ class RouterCapture:
         self._routers = list(router_modules)
         self._experts = list(experts_modules) if experts_modules is not None else None
         self._handles: list[Any] = []
-        self._patched: list[tuple[Any, str, Any]] = []  # (module, attr, original) for restore
+        self._patched: list[tuple[Any, str, Any]] = []  # (owner, attr, original) for restore
         # trace_layer -> captured tensors for the in-flight document
         self.inputs: dict[int, np.ndarray] = {}
         self.outputs: dict[int, np.ndarray] = {}
-        self.topk_ids: dict[int, np.ndarray] = {}
+        # vLLM's own selections, in CALL ORDER within the in-flight document (see class docstring).
+        self._topk_calls: list[np.ndarray] = []
+
+    @property
+    def topk_ids(self) -> dict[int, np.ndarray]:
+        """vLLM's captured selections keyed by call order (0-based), i.e. by MoE layer in prefill.
+
+        A property, not a stored dict, so it always reflects the ordered calls the wrapper recorded
+        for the current document. ``topk_ids[L]`` is [n_tokens, top_k] for layer ``L``.
+        """
+        return {i: arr for i, arr in enumerate(self._topk_calls)}
 
     def register(self) -> None:
         for trace_layer, router in enumerate(self._routers):
@@ -436,38 +455,57 @@ class RouterCapture:
             self._handles.append(router.register_forward_hook(hook))
 
         if self._experts is not None:
-            for trace_layer, experts in enumerate(self._experts):
-                self._wrap_select_experts(experts, trace_layer)
+            self._wrap_select_experts(self._experts)
 
-    def _wrap_select_experts(self, experts: Any, trace_layer: int) -> None:
-        """Wrap ``experts.select_experts`` to stash the returned topk_ids for this layer.
+    @staticmethod
+    def _defining_class(cls: type, attr: str) -> type | None:
+        """The class in ``cls``'s MRO that actually defines ``attr`` (where the name binds)."""
+        for c in cls.__mro__:
+            if attr in c.__dict__:
+                return c
+        return None
 
-        vLLM's ``select_experts`` returns ``(topk_weights, topk_ids)``; topk_ids is the authoritative
-        selection the kernel routes on (I1). We only observe it — the wrapper returns the original
-        result untouched, so the model's numerics are unchanged.
+    def _wrap_select_experts(self, experts_modules: Sequence[Any]) -> None:
+        """Wrap ``FusedMoE.select_experts`` on the CLASS to stash each call's topk_ids in order.
+
+        vLLM's ``select_experts`` is a staticmethod called as ``FusedMoE.select_experts(...)`` via
+        the class, so wrapping an instance attribute would never fire (that was the original bug —
+        it silently captured nothing). We patch the defining class once, appending each returned
+        ``topk_ids`` to :attr:`_topk_calls`. The wrapper returns the original result untouched, so
+        the model's numerics are unchanged.
         """
-        original = getattr(experts, "select_experts", None)
-        if original is None or not callable(original):
-            raise CaptureError(
-                f"layer {trace_layer}: experts module {type(experts).__name__} has no callable "
-                "select_experts; cannot capture vLLM's own selection. Pass the correct FusedMoE "
-                "module, or omit experts_modules and supply topk another way."
-            )
+        seen: set[type] = set()
+        for experts in experts_modules:
+            owner = self._defining_class(type(experts), "select_experts")
+            if owner is None:
+                raise CaptureError(
+                    f"experts module {type(experts).__name__} has no select_experts anywhere in "
+                    "its MRO; cannot capture vLLM's own selection. Pass the FusedMoE modules, or "
+                    "omit experts_modules and supply topk another way."
+                )
+            if owner in seen:
+                continue
+            seen.add(owner)
 
-        def wrapped(*args, _orig=original, _layer=trace_layer, **kwargs):
-            result = _orig(*args, **kwargs)
-            topk_ids = result[1] if isinstance(result, (tuple, list)) else result
-            self.topk_ids[_layer] = _to_2d_numpy(topk_ids).astype(TOPK_DTYPE)
-            return result
+            raw = owner.__dict__["select_experts"]  # the staticmethod descriptor, to restore later
+            # Underlying function whether it is a staticmethod (expected) or a plain function.
+            original_fn = raw.__func__ if isinstance(raw, staticmethod) else raw
+            calls = self._topk_calls
 
-        setattr(experts, "select_experts", wrapped)
-        self._patched.append((experts, "select_experts", original))
+            def wrapped(*args, _orig=original_fn, _calls=calls, **kwargs):
+                result = _orig(*args, **kwargs)
+                topk_ids = result[1] if isinstance(result, (tuple, list)) else result
+                _calls.append(_to_2d_numpy(topk_ids).astype(TOPK_DTYPE))
+                return result
+
+            setattr(owner, "select_experts", staticmethod(wrapped))
+            self._patched.append((owner, "select_experts", raw))
 
     def reset(self) -> None:
         """Clear the per-document buffers. Call before each document's prefill."""
         self.inputs.clear()
         self.outputs.clear()
-        self.topk_ids.clear()
+        self._topk_calls.clear()
 
     def remove(self) -> None:
         for h in self._handles:

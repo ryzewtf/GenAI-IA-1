@@ -255,18 +255,12 @@ def test_double_layer_ingest_refused():
 # the P1 gate an independent test rather than a tautology — is plain Python and testable with a
 # fake experts module. torch is only imported lazily inside _to_2d_numpy, so we pass numpy arrays
 # that quack like tensors just enough for the code paths exercised here.
-
-
-class _FakeExperts:
-    """Stands in for a vLLM FusedMoE: its select_experts returns (topk_weights, topk_ids)."""
-
-    def __init__(self, topk_ids):
-        self._topk_ids = topk_ids
-        self.calls = 0
-
-    def select_experts(self, *args, **kwargs):
-        self.calls += 1
-        return ("weights-sentinel", self._topk_ids)
+#
+# The wrapper patches select_experts on the CLASS as a staticmethod, because that is exactly how
+# vLLM calls it: `FusedMoE.select_experts(...)`, via the class, never `self.select_experts(...)`.
+# The fakes model that faithfully — a staticmethod invoked through the class — so the test exercises
+# the real dispatch path (an instance-attribute patch, the original bug, would silently capture
+# nothing here just as it did on the GPU).
 
 
 class _FakeNpTensor:
@@ -295,27 +289,37 @@ def _patch_torch(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "torch", fake)
 
 
-def test_select_experts_wrapper_captures_topk_and_is_transparent(monkeypatch):
+def test_select_experts_wrapper_captures_topk_in_order_and_is_transparent(monkeypatch):
     _patch_torch(monkeypatch)
-    topk = _FakeNpTensor(np.array([[1, 4, 7], [2, 3, 5]], dtype=np.int64))
-    experts = _FakeExperts(topk)
-    # One layer: one router (unused here) + one experts module.
-    cap = RouterCapture(router_modules=[object()], experts_modules=[experts])
-    cap._wrap_select_experts(experts, trace_layer=0)  # register() would also hook the router
 
-    result = experts.select_experts("hidden", "router_logits")
+    class _FakeMoE:
+        """Stands in for vLLM FusedMoE: select_experts is a STATICMETHOD called via the class."""
+
+        @staticmethod
+        def select_experts(*args, **kwargs):
+            return ("weights-sentinel", kwargs["topk_ids"])
+
+    original = _FakeMoE.__dict__["select_experts"]  # the staticmethod descriptor, to compare later
+    e0, e1 = _FakeMoE(), _FakeMoE()                  # two layers sharing one class
+    cap = RouterCapture(router_modules=[object(), object()], experts_modules=[e0, e1])
+    cap._wrap_select_experts([e0, e1])               # patches the class once
+
+    # vLLM invokes it through the CLASS (staticmethod) — the case an instance patch would miss.
+    r0 = _FakeMoE.select_experts(topk_ids=_FakeNpTensor(np.array([[1, 4, 7], [2, 3, 5]], np.int64)))
+    r1 = _FakeMoE.select_experts(topk_ids=_FakeNpTensor(np.array([[0, 2, 6]], np.int64)))
+
     # The wrapper returns the ORIGINAL result untouched (numerics unchanged).
-    assert result[0] == "weights-sentinel"
-    assert experts.calls == 1
-    # ...and stashed vLLM's topk_ids as int32 for layer 0.
+    assert r0[0] == "weights-sentinel" and r1[0] == "weights-sentinel"
+    # ...and stashed each call's topk_ids as int32, keyed by CALL ORDER == layer.
     assert cap.topk_ids[0].dtype == TOPK_DTYPE
     assert cap.topk_ids[0].tolist() == [[1, 4, 7], [2, 3, 5]]
+    assert cap.topk_ids[1].tolist() == [[0, 2, 6]]
 
-    # remove() restores the original bound method.
-    original = experts.select_experts
-    cap._patched = [(experts, "select_experts", _FakeExperts.select_experts.__get__(experts))]
+    # reset() clears the per-document call log; remove() restores the original staticmethod.
+    cap.reset()
+    assert cap.topk_ids == {}
     cap.remove()
-    assert experts.select_experts != original  # restored to the unwrapped method
+    assert _FakeMoE.__dict__["select_experts"] is original  # exact descriptor restored
 
 
 def test_experts_modules_must_align_with_routers():
@@ -327,4 +331,4 @@ def test_missing_select_experts_is_a_halt(monkeypatch):
     _patch_torch(monkeypatch)
     cap = RouterCapture(router_modules=[object()], experts_modules=[object()])
     with pytest.raises(CaptureError):
-        cap._wrap_select_experts(object(), trace_layer=0)  # no select_experts attr
+        cap._wrap_select_experts([object()])  # object() has no select_experts anywhere in its MRO
