@@ -6,15 +6,15 @@ P0 (notebooks/vllm_probe.ipynb) proved an INT4 MoE loads and generates on a Kagg
 the CAPTURE works: that we can pull the three router streams (§1.6) out of a vLLM forward pass and
 write them in the frozen trace format, with topk.bin matching vLLM's own expert selection.
 
-Per the user's "smallest first" rule, this runs the EASY path only: OLMoE-1B-7B-0125 fits on ONE
-T4, so tensor_parallel_size=1 and the router modules live in the driver process where Python
-forward-hooks can reach them. The two TP=2 models (Qwen3-30B, Gemma-4) need vLLM's in-worker
+Per the user's "smallest first" rule, this runs the EASY path only: OLMoE-1B-7B-0125's fp16 weights
+(~12.9 GiB) fit on ONE T4, so tensor_parallel_size=1 and the router modules live in the driver
+process where Python forward-hooks can reach them. The two TP=2 models (Qwen3-30B, Gemma-4) need vLLM's in-worker
 capturer and are a separate step; this notebook validates the streams themselves before that.
 
 What it proves, in order
 ------------------------
-1. The env recipe from P0 still loads OLMoE at TP=1 (fp16 — OLMoE is not quantized; ~4.2 GB fits
-   one card, no GPTQ needed for the small models).
+1. The env recipe from P0 still loads OLMoE at TP=1 (fp16 — OLMoE is not quantized; the 7B fp16
+   weights are ~12.9 GiB, which fills most of one T4, so util is pushed high and ctx kept short).
 2. The vLLM module tree actually contains a router per MoE layer at the path models.yaml predicts
    (model.layers.{i}.mlp.gate). This is PRINTED, not assumed — vLLM's internal names differ from
    HuggingFace's and must be confirmed on the box (the analogue of llama.cpp's T1.4 node scan).
@@ -102,23 +102,58 @@ print(">>> Proceed to Cell 3 only if IMPORT_OK printed. DO NOT restart the kerne
 '''
 
 REPO_SRC = '''# ============================================================================
-# Cell 3 — get src/ onto the path (the harness lives in the repo, not the notebook).
+# Cell 3 — clone the repo at GIT_REF and put src/ on the path (same logic as moe_session.ipynb).
 # ============================================================================
 # The pipeline convention is: no logic in notebooks. src/capture/vllm_trace.py and
-# src/traces/format.py do the work; this cell just makes them importable. Adjust REPO to wherever
-# the repo is available in your Kaggle session (a private GitHub clone, or an attached dataset).
-import os, sys, subprocess
+# src/traces/format.py do the work; this cell just clones the repo and makes them importable.
+import os, subprocess, sys
+from pathlib import Path
 
-REPO = "/kaggle/working/moe"   # EDIT if your repo is mounted elsewhere (e.g. a dataset path)
-if not os.path.isdir(REPO):
-    # If you attach the repo as a Kaggle dataset instead, set REPO to that path and skip the clone.
-    print("Repo not found at", REPO, "-- set REPO to your clone/dataset path.")
+GIT_URL = "https://github.com/ryzewtf/GenAI-IA-1.git"
+GIT_REF = "VLLM_PORT"                       # the vLLM-port branch (holds src/capture/vllm_trace.py)
+REPO = Path("/kaggle/working/repo")
+
+
+def run(cmd, cwd=None, check=True, quiet=False):
+    if not quiet:
+        print("$", " ".join(str(c) for c in cmd), flush=True)
+    p = subprocess.run([str(c) for c in cmd], cwd=cwd and str(cwd), text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.stdout and not quiet:
+        print(p.stdout, flush=True)
+    if check and p.returncode != 0:
+        raise SystemExit(f"FAILED ({p.returncode}): {' '.join(str(c) for c in cmd)}")
+    return p
+
+
+# A private repo needs a token; a public one must not be handed one. Kaggle Secrets is the only
+# place a token belongs -- an inline PAT is committed the moment the notebook is saved.
+url = GIT_URL
+try:
+    from kaggle_secrets import UserSecretsClient
+    tok = UserSecretsClient().get_secret("GITHUB_TOKEN")
+    if tok:
+        url = GIT_URL.replace("https://", f"https://{tok}@")
+        print("using GITHUB_TOKEN from Kaggle Secrets")
+except Exception:
+    print("no GITHUB_TOKEN secret; cloning anonymously (fine if the repo is public)")
+
+if REPO.exists():
+    run(["git", "fetch", "--all", "--tags"], cwd=REPO)
+    run(["git", "checkout", GIT_REF], cwd=REPO)
+    run(["git", "pull", "--ff-only"], cwd=REPO, check=False)
 else:
-    if REPO not in sys.path:
-        sys.path.insert(0, REPO)
-    import src.capture.vllm_trace as _vt  # noqa: F401
-    import src.traces.format as _fmt       # noqa: F401
-    print("src importable from", REPO)
+    run(["git", "clone", url, str(REPO)])
+    run(["git", "checkout", GIT_REF], cwd=REPO)
+
+HEAD = run(["git", "rev-parse", "HEAD"], cwd=REPO, quiet=True).stdout.strip()
+print(f"\\nrepo at {HEAD}  (ref {GIT_REF})")
+
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+import src.capture.vllm_trace as _vt  # noqa: F401
+import src.traces.format as _fmt       # noqa: F401
+print("src importable from", REPO)
 '''
 
 LOAD_SRC = '''# ============================================================================
@@ -127,10 +162,40 @@ LOAD_SRC = '''# ================================================================
 import os
 os.environ["VLLM_USE_V1"] = "0"                    # Turing needs the V0 engine (P0-confirmed).
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # curbs fragmentation
 
-MODEL_ID = "allenai/OLMoE-1B-7B-0125"              # ~4.2 GB, fp16, fits ONE T4. Not quantized.
+# --- free GPU left over from a PRIOR failed load in this kernel -------------------------------
+# We do NOT restart the kernel (a Kaggle restart reverts Cell 2's pip installs). But a failed
+# LLM(...) leaves ~13 GiB of OLMoE weights resident on card 0, and re-running this cell would then
+# OOM on top of them. IPython also pins the dead engine alive via its stored traceback, so clear
+# that too, then drop any prior `llm` and empty the CUDA cache. Safe to run even on a clean card.
+import gc, sys, torch
+for _attr in ("last_traceback", "last_value", "last_type"):
+    try:
+        setattr(sys, _attr, None)
+    except Exception:
+        pass
+try:
+    del llm                                        # noqa: F821 -- may not exist yet
+except NameError:
+    pass
+gc.collect(); gc.collect()
+torch.cuda.empty_cache()
+_free, _total = torch.cuda.mem_get_info()
+print(f"GPU0 free before load: {_free/2**30:.2f} GiB / {_total/2**30:.2f} GiB")
+if _free < 13.3 * 2**30:
+    print("  WARNING: <13.3 GiB free -- a prior load is still resident. If the load below OOMs,")
+    print("  do Kaggle 'Restart & clear cell outputs', then re-run from Cell 2 (reinstall ~2 min).")
+
+MODEL_ID = "allenai/OLMoE-1B-7B-0125"              # 6.9B params -> ~12.9 GiB fp16 on ONE T4.
 N_MOE_LAYERS = 16                                   # models.yaml: olmoe-0125
 
+# OLMoE is a 7B model: unquantized fp16 weights are ~12.9 GiB, and a 14.56 GiB T4 has almost no
+# room left for KV cache. At util 0.85 the KV budget goes NEGATIVE (weights > budget) and vLLM
+# raises "No available memory for the cache blocks". Fix, staying at TP=1 (Python hooks must reach
+# the router in-process): give the card almost entirely to vLLM (0.95) and shrink the context to
+# what this 3-short-prompt probe actually needs. 0.95*14.56 = 13.83 GiB - 12.9 weights - ~0.5
+# activation leaves ~0.4 GiB KV, i.e. a few thousand tokens at 1024 ctx -- ample here.
 import torch
 from vllm import LLM, SamplingParams
 
@@ -139,8 +204,9 @@ llm = LLM(
     tensor_parallel_size=1,                         # single card -> hooks reach the router
     enforce_eager=True,                             # required on Turing; also needed for hooks
     dtype="float16",
-    max_model_len=2048,
-    gpu_memory_utilization=0.85,
+    max_model_len=1024,                             # probe prompts are short; frees KV headroom
+    max_num_seqs=1,                                 # one doc at a time -> minimal KV footprint
+    gpu_memory_utilization=0.95,                    # 0.85 left the KV cache NEGATIVE for this 7B
 )
 
 # Reach the underlying torch nn.Module. On the V0 engine this is the model runner's `model`.
