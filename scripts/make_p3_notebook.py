@@ -133,21 +133,24 @@ LOCAL_ROOT = Path("/tmp/vtraces")     # local backend: the durable trace copy to
 SCRATCH = Path("/tmp/vscratch")       # per-shard scratch (deleted after each verified upload)
 CORPUS_NAME = "p3tiny"
 
+# (text, split). All three splits (train/val/test) must be non-empty or T5.3's
+# split_coverage check FAILs the shard set (H/CE are estimated on test, §1.2). shard_id = i // 3,
+# so each 3-doc shard carries one train + one val + one test doc.
 DOCS = [
-    "The quick brown fox jumps over the lazy dog.",
-    "In 1969, humans first walked on the surface of the Moon.",
-    "Photosynthesis converts light energy into chemical energy in plants.",
-    "The mitochondria is the powerhouse of the cell.",
-    "Paris is the capital of France and sits on the Seine.",
-    "A group of flamingos is called a flamboyance.",
+    ("The quick brown fox jumps over the lazy dog.", "train"),
+    ("In 1969, humans first walked on the surface of the Moon.", "val"),
+    ("Photosynthesis converts light energy into chemical energy in plants.", "test"),
+    ("The mitochondria is the powerhouse of the cell.", "train"),
+    ("Paris is the capital of France and sits on the Seine.", "val"),
+    ("A group of flamingos is called a flamboyance.", "test"),
 ]
 with CORPUS.open("w", encoding="ascii", newline="\\n") as fh:
-    for i, text in enumerate(DOCS):
+    for i, (text, split) in enumerate(DOCS):
         fh.write(json.dumps({
             "doc_id": i, "text": text, "domain": "prose", "lang": "en", "source": "p3",
-            "n_tokens_ref": len(text.split()), "split": "train", "shard_id": i // 3,   # 2 shards
+            "n_tokens_ref": len(text.split()), "split": split, "shard_id": i // 3,   # 2 shards
         }) + "\\n")
-print("wrote", CORPUS, "with", len(DOCS), "docs in 2 shards")
+print("wrote", CORPUS, "with", len(DOCS), "docs in 2 shards (train/val/test)")
 
 
 def collect_and_validate(model_key):
