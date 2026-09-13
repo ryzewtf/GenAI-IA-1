@@ -1,0 +1,79 @@
+# Pinned runtime configuration — vLLM engine (Kaggle 2×T4, sm_75).
+#
+# CONTRACT (plan S.3): every field under `hashed:` is folded into `run_config_sha256`, written
+# into every shard manifest. Shards whose hashes differ are DIFFERENT EXPERIMENTS and merging
+# them is a hard error. This is the vLLM counterpart of run.yaml (the llama.cpp config, kept as
+# the documented fallback). A different ENGINE is by definition a different experiment, so this
+# file necessarily hashes differently from run.yaml — the vLLM traces do not merge with the
+# llama.cpp ones, and the whole panel is re-collected under this identity (accepted 2026-09-12).
+#
+# What is here vs. what is per-model: this block holds only settings shared across the WHOLE
+# panel, so run_config_sha256 is model-independent (per-model identity comes from the model hash
+# + `quant`/`router_dtype`/`logit_tensor_used` in the manifest, and per-model `tensor_parallel`
+# / `gpu_memory_utilization` live in models.yaml, NOT here). Putting a per-model knob here would
+# fragment the run hash across the panel for no reason.
+
+schema_version: 1
+
+hashed:
+  # --- platform -------------------------------------------------------------------------
+  # I3: kernel selection differs by architecture, so the target is hashed. 75 = Turing/T4.
+  platform:
+    gpu_arch: 75              # 75 = Turing/T4 (Kaggle). vLLM V1 refuses < 8.0 → V0 engine below.
+    n_devices: 2              # two T4s available; per-model tensor_parallel lives in models.yaml
+
+  # --- build ----------------------------------------------------------------------------
+  # The engine identity. `engine: vllm` is what RunConfig.assert_collection_ready() branches on;
+  # without it a config is treated as llama.cpp (run.yaml's shape).
+  build:
+    engine: vllm
+    # Pinned end-to-end on 2026-09-12 (P0) and 2026-09-13 (P1). 0.10.2 carries the moe_wna16
+    # loader fix (PR #22797); let vLLM pull its own torch — do NOT hard-pin torch (recipe note).
+    vllm_version: "0.10.2"
+    torch_version: "2.8.0+cu128"      # what 0.10.2 pulls; recorded, not pinned via pip
+    transformers_version: "4.55.2"    # avoids the torch.compiler.disable(reason=) skew
+    # Turing forces these three, and each is numerics-visible, so each is hashed:
+    engine_version: v0        # VLLM_USE_V1=0 — V1 hard-raises on compute capability < 8.0
+    attention_backend: xformers   # FA2 is unavailable on Turing; XFormers is what vLLM selects
+    dtype: float16            # bf16 unsupported on Turing; fp16 activations (GPTQ weights are int4)
+    enforce_eager: true       # no CUDA graphs on Turing AND the determinism/hook precondition
+
+  # --- inference ------------------------------------------------------------------------
+  # Only the deterministic, panel-wide knobs are hashed. gpu_memory_utilization is operational
+  # (it sizes the KV cache, not the logits) and is per-model, so it lives under `unhashed`.
+  inference:
+    max_model_len: 2048       # I4 analogue: pin context explicitly (never the arch default)
+    max_num_seqs: 1           # one document at a time → deterministic, minimal KV footprint
+    seed: 0                   # pinned; prefill-only greedy capture does not sample, but pin anyway
+
+  # --- capture ---------------------------------------------------------------------------
+  # Identical semantics to run.yaml: the trace files and their meaning do not change with engine.
+  capture:
+    mode: prefill_only        # no autoregressive generation (§0b)
+    clear_kv_between_docs: true   # this is what makes document-level sharding bit-exact (S.3)
+    hidden_subsample_n: 50000     # O2; never drop topk.bin
+    streams: [tokens, topk, logits, hidden]
+
+  # --- analysis ----------------------------------------------------------------------------
+  # Engine-independent; kept byte-identical to run.yaml so the analysis is defined the same way.
+  analysis:
+    epsilon_mix: 1.0e-6       # §1.2 — guarantees FINITE CE, NOT non-negative Î. Do not tune.
+    entropy_estimator: miller_madow
+    clamp_mi_at_zero: false   # I8 — negative Î is diagnostic; reporting it is the policy
+
+unhashed:
+  # Operational only. Changing these does not invalidate a shard.
+  inference:
+    # Per-model, and it sizes the KV cache rather than changing any logit, so it is NOT hashed.
+    # OLMoE (7B fp16) needs ~0.95 to leave room for KV on one 14.56 GiB T4; the big GPTQ models
+    # have more headroom. kaggle_collect will set this per model from models.yaml.
+    gpu_memory_utilization: 0.95
+  session:
+    wall_limit_s: 43200       # 12 h Kaggle batch cap
+    reserve_s: 1800           # flush + upload headroom before the cap
+  paths:
+    scratch: /tmp/moe         # the only large writable mount on the Kaggle image (T0.1)
+    working: /kaggle/working
+  upload:
+    backend: hf               # traces to HF Hub, never to /kaggle/working (I9)
+    verify_round_trip: true   # SHA256 after download-back, before marking a shard complete

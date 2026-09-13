@@ -22,8 +22,13 @@ from src.capture.vllm_trace import (
     GatingOp,
     RouterCapture,
     SelectionMismatch,
+    discover_router_and_experts,
     gating_from_config,
     recompute_topk,
+    worker_drain_capture,
+    worker_install_capture,
+    worker_remove_capture,
+    worker_reset_capture,
 )
 from src.traces.format import (
     FLAG_HIDDEN_CAPTURED,
@@ -332,3 +337,101 @@ def test_missing_select_experts_is_a_halt(monkeypatch):
     cap = RouterCapture(router_modules=[object()], experts_modules=[object()])
     with pytest.raises(CaptureError):
         cap._wrap_select_experts([object()])  # object() has no select_experts anywhere in its MRO
+
+
+# -- module discovery + TP>1 worker-injection glue (torch-free fakes) --------------------------
+#
+# The TP=2 path can only be proven on a paid multi-GPU session, but its plumbing — discovering the
+# router/experts modules by suffix, and the collective_rpc entrypoints that stash/drain a capture on
+# a worker — is plain Python and testable here. The fakes model the shapes the real code touches:
+# a module tree with `.named_modules()`, hookable router modules, and a FusedMoE-like experts CLASS
+# whose select_experts is a staticmethod (so the class-level patch is what fires, as on the GPU).
+
+
+class _FakeHandle:
+    def remove(self):
+        pass
+
+
+class _FakeGate:
+    def register_forward_pre_hook(self, fn):
+        return _FakeHandle()
+
+    def register_forward_hook(self, fn):
+        return _FakeHandle()
+
+
+def _fake_moe_model(n_layers):
+    """A stand-in vLLM model: n_layers of `model.layers.{i}.mlp.{gate,experts}`.
+
+    Returns (model, ExpertsClass). All experts instances share ExpertsClass, so the class-level
+    select_experts patch is installed once — exactly the real dispatch.
+    """
+    class _FakeExpertsCls:
+        @staticmethod
+        def select_experts(*args, **kwargs):
+            return ("weights-sentinel", kwargs["topk_ids"])
+
+    mods = {}
+    for i in range(n_layers):
+        mods[f"model.layers.{i}.mlp.gate"] = _FakeGate()
+        mods[f"model.layers.{i}.mlp.experts"] = _FakeExpertsCls()
+
+    class _FakeModel:
+        def named_modules(self):
+            return list(mods.items())
+
+    return _FakeModel(), _FakeExpertsCls
+
+
+def test_discover_orders_by_layer_number_not_lexically():
+    model, _ = _fake_moe_model(11)  # layers 0..10 — a lexical sort would put '10' before '2'
+    routers, experts, gnames, enames = discover_router_and_experts(model, n_expected=11)
+    assert len(routers) == 11 and len(experts) == 11
+    assert gnames[0] == "model.layers.0.mlp.gate"
+    assert gnames[-1] == "model.layers.10.mlp.gate"    # numeric ordering, not "model.layers.9..."
+    assert enames[-1] == "model.layers.10.mlp.experts"
+
+
+def test_discover_raises_on_bad_suffix_and_wrong_count():
+    model, _ = _fake_moe_model(4)
+    with pytest.raises(CaptureError, match="router_suffix"):
+        discover_router_and_experts(model, router_suffix=".mlp.nope")
+    with pytest.raises(CaptureError, match="expected 99"):
+        discover_router_and_experts(model, n_expected=99)
+
+
+def test_worker_install_reset_drain_remove_roundtrip(monkeypatch):
+    _patch_torch(monkeypatch)
+    import types
+
+    model, ExpertsCls = _fake_moe_model(3)
+    worker = types.SimpleNamespace(rank=0, model_runner=types.SimpleNamespace(model=model))
+
+    ack = worker_install_capture(worker, n_moe_layers=3)
+    assert ack == {"rank": 0, "n_gates": 3, "first_gate": "model.layers.0.mlp.gate"}
+    assert worker._moe_capture is not None
+
+    # vLLM calls select_experts via the CLASS; two calls -> layers 0,1 in order.
+    ExpertsCls.select_experts(topk_ids=_FakeNpTensor(np.array([[1, 4, 7]], np.int64)))
+    ExpertsCls.select_experts(topk_ids=_FakeNpTensor(np.array([[2, 3, 5]], np.int64)))
+    drained = worker_drain_capture(worker)
+    assert drained["rank"] == 0
+    assert drained["topk_ids"][0].tolist() == [[1, 4, 7]]
+    assert drained["topk_ids"][1].tolist() == [[2, 3, 5]]
+
+    worker_reset_capture(worker)
+    assert worker_drain_capture(worker)["topk_ids"] == {}      # per-document buffers cleared
+
+    worker_remove_capture(worker)
+    assert worker._moe_capture is None
+    assert isinstance(ExpertsCls.__dict__["select_experts"], staticmethod)  # class restored
+
+
+def test_worker_drain_is_none_before_install():
+    import types
+
+    assert worker_drain_capture(types.SimpleNamespace()) is None
+    # reset/remove on a worker with no capture must be no-ops, not errors.
+    worker_reset_capture(types.SimpleNamespace())
+    worker_remove_capture(types.SimpleNamespace())

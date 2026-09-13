@@ -28,6 +28,7 @@ from src.runtime.session import SessionBudget
 from src.runtime.state import ShardRecord, ShardState, StateError
 
 REPO_RUN_CONFIG = "configs/run.yaml"
+REPO_RUN_VLLM_CONFIG = "configs/run_vllm.yaml"
 
 
 # -- config hashing --------------------------------------------------------------------------
@@ -132,6 +133,52 @@ def test_collection_readiness_catches_the_expensive_mistakes(tmp_path):
         path.write_text(yaml.safe_dump(broken), encoding="utf-8")
         with pytest.raises(ConfigError, match=pattern):
             RunConfig.load(path).assert_collection_ready()
+
+
+def test_vllm_config_loads_is_ready_and_hashes_distinctly():
+    """The vLLM config is a DIFFERENT experiment: it must validate and hash unlike run.yaml."""
+    llama = RunConfig.load(REPO_RUN_CONFIG)
+    vllm = RunConfig.load(REPO_RUN_VLLM_CONFIG)
+    assert vllm.engine == "vllm"
+    assert llama.engine == "llama_cpp"          # absent engine key defaults to llama_cpp
+    vllm.assert_collection_ready()               # shipped vLLM config is ready as-is
+    # A different engine is a different experiment (plan S.3) -> the hashes must not collide.
+    assert vllm.sha256 != llama.sha256
+
+
+def test_vllm_readiness_catches_the_turing_forced_knobs(tmp_path):
+    """On sm_75 the V0 engine, eager mode, fp16 and a pinned context are not optional."""
+    base = yaml.safe_load(open(REPO_RUN_VLLM_CONFIG, encoding="utf-8"))
+    ready = tmp_path / "ready.yaml"
+    ready.write_text(yaml.safe_dump(base), encoding="utf-8")
+    RunConfig.load(ready).assert_collection_ready()  # baseline must not raise
+
+    for mutate, pattern in [
+        (lambda c: c["hashed"]["build"].__setitem__("engine_version", "v1"), "engine_version"),
+        (lambda c: c["hashed"]["build"].__setitem__("enforce_eager", False), "enforce_eager"),
+        (lambda c: c["hashed"]["build"].__setitem__("dtype", "bfloat16"), "unsupported on Turing"),
+        (lambda c: c["hashed"]["build"].__setitem__("vllm_version", None), "vllm_version"),
+        (lambda c: c["hashed"]["build"].__setitem__("attention_backend", None), "attention_backend"),
+        (lambda c: c["hashed"]["inference"].__setitem__("max_model_len", None), "max_model_len"),
+        # engine-independent invariants still apply on the vLLM path
+        (lambda c: c["hashed"]["capture"].__setitem__("streams", ["logits"]), "topk"),
+        (lambda c: c["hashed"]["analysis"].__setitem__("clamp_mi_at_zero", True), "clamp"),
+    ]:
+        broken = json.loads(json.dumps(base))
+        mutate(broken)
+        path = tmp_path / "broken.yaml"
+        path.write_text(yaml.safe_dump(broken), encoding="utf-8")
+        with pytest.raises(ConfigError, match=pattern):
+            RunConfig.load(path).assert_collection_ready()
+
+
+def test_unknown_engine_is_refused(tmp_path):
+    base = yaml.safe_load(open(REPO_RUN_VLLM_CONFIG, encoding="utf-8"))
+    base["hashed"]["build"]["engine"] = "tensorrt"
+    path = tmp_path / "unknown.yaml"
+    path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    with pytest.raises(ConfigError, match="engine"):
+        RunConfig.load(path).assert_collection_ready()
 
 
 def test_assert_shards_compatible_reports_every_conflict():

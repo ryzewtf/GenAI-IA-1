@@ -129,6 +129,11 @@ class RunConfig:
         return int(self.platform["gpu_arch"])
 
     @property
+    def engine(self) -> str:
+        """Collection engine. Absent == ``llama_cpp`` (run.yaml predates the vLLM port)."""
+        return str(self.build.get("engine", "llama_cpp"))
+
+    @property
     def epsilon_mix(self) -> float:
         return float(self.analysis["epsilon_mix"])
 
@@ -137,14 +142,30 @@ class RunConfig:
     def assert_collection_ready(self) -> None:
         """Refuse to start a capture run under an under-specified config.
 
-        Checks the things that are cheap to get wrong and expensive to discover afterwards:
-        an unpinned build commit, a missing context cap (Gemma 4 would try to allocate a
-        262144-token KV cache), an auto tensor split (varies with free VRAM between sessions,
-        which silently changes which device computes which layer), and a clamped mutual
-        information (plan §1.2 forbids it).
+        The build/inference knobs that are numerics-visible differ by engine, so this dispatches
+        on ``build.engine``. The capture and analysis invariants are engine-independent (the trace
+        files and how the analysis is defined do not change with the engine) and are checked for
+        both. Everything here is cheap to get wrong and expensive to discover after a paid session.
         """
         problems: list[str] = []
+        if self.engine == "vllm":
+            self._collect_vllm_problems(problems)
+        elif self.engine == "llama_cpp":
+            self._collect_llama_cpp_problems(problems)
+        else:
+            problems.append(
+                f"build.engine={self.engine!r} is unknown — expected 'vllm' or 'llama_cpp'"
+            )
+        self._collect_capture_analysis_problems(problems)
 
+        if problems:
+            raise ConfigError(
+                f"{self.source_path} is not ready for collection:\n  - "
+                + "\n  - ".join(problems)
+            )
+
+    def _collect_llama_cpp_problems(self, problems: list[str]) -> None:
+        """llama.cpp-specific readiness: build commit, context cap, tensor split, flash-attn."""
         if not self.build.get("llama_cpp_commit"):
             problems.append(
                 "build.llama_cpp_commit is null — pin it from T0.2 before collecting"
@@ -155,8 +176,7 @@ class RunConfig:
                 "intermittently on a different Kaggle host"
             )
 
-        ctx = self.inference.get("ctx_size")
-        if not ctx:
+        if not self.inference.get("ctx_size"):
             problems.append("inference.ctx_size must be set explicitly (invariant I4)")
 
         if self.inference.get("n_gpu_layers", 0) < 1:
@@ -186,6 +206,51 @@ class RunConfig:
                 "CPU-pinned router once in T3.7 instead"
             )
 
+    def _collect_vllm_problems(self, problems: list[str]) -> None:
+        """vLLM-specific readiness: the Turing-forced knobs and a pinned context cap.
+
+        On sm_75 three settings are not optional and each is numerics-visible: the V0 engine (V1
+        refuses compute capability < 8.0), eager mode (Turing has no usable CUDA-graph MoE path,
+        and it is also the precondition for the capture hooks), and fp16 (bf16 is unsupported). A
+        config that leaves any of them to a default is a silent confound across sessions.
+        """
+        if not self.build.get("vllm_version"):
+            problems.append(
+                "build.vllm_version is null — pin it (0.10.2 is the P0/P1-verified pin)"
+            )
+        if not self.build.get("attention_backend"):
+            problems.append(
+                "build.attention_backend must be pinned — vLLM selects XFormers on Turing "
+                "(FA2 is unavailable), and an unpinned default is a silent confound"
+            )
+        if not self.build.get("enforce_eager", False):
+            problems.append(
+                "build.enforce_eager must be true — Turing has no usable CUDA-graph MoE path and "
+                "the capture hooks require eager execution"
+            )
+
+        turing = self.gpu_arch < 80
+        if turing and str(self.build.get("engine_version", "")).lower() != "v0":
+            problems.append(
+                "build.engine_version must be 'v0' on compute capability < 8.0 — vLLM V1 "
+                "hard-raises NotImplementedError there (set VLLM_USE_V1=0)"
+            )
+        dtype = str(self.build.get("dtype", "")).lower()
+        if not dtype:
+            problems.append("build.dtype must be set explicitly (float16 on Turing)")
+        elif turing and dtype in ("bfloat16", "bf16"):
+            problems.append(
+                f"build.dtype={dtype!r} is unsupported on Turing (sm_75) — use float16"
+            )
+
+        if not self.inference.get("max_model_len"):
+            problems.append(
+                "inference.max_model_len must be set explicitly (invariant I4; never the arch "
+                "default — some panel models default to a 262144-token context)"
+            )
+
+    def _collect_capture_analysis_problems(self, problems: list[str]) -> None:
+        """Engine-independent invariants: prefill-only capture, cleared KV, topk, and finite MI."""
         if self.capture.get("mode") != "prefill_only":
             problems.append("capture.mode must be 'prefill_only'")
         if not self.capture.get("clear_kv_between_docs", False):
@@ -204,12 +269,6 @@ class RunConfig:
         eps = self.analysis.get("epsilon_mix")
         if not eps or eps <= 0:
             problems.append("analysis.epsilon_mix must be a positive float")
-
-        if problems:
-            raise ConfigError(
-                f"{self.source_path} is not ready for collection:\n  - "
-                + "\n  - ".join(problems)
-            )
 
     # -- manifest glue ------------------------------------------------------------------
 

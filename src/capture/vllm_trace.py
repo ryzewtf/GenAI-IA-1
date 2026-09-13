@@ -66,6 +66,11 @@ __all__ = [
     "DocumentTrace",
     "recompute_topk",
     "gating_from_config",
+    "discover_router_and_experts",
+    "worker_install_capture",
+    "worker_reset_capture",
+    "worker_drain_capture",
+    "worker_remove_capture",
 ]
 
 
@@ -507,6 +512,20 @@ class RouterCapture:
         self.outputs.clear()
         self._topk_calls.clear()
 
+    def drain(self) -> dict[str, dict[int, np.ndarray]]:
+        """Return the current document's captured streams as plain numpy, keyed by layer.
+
+        Everything here is already numpy (the hooks convert on capture), so the result is
+        picklable — which is what lets a worker process hand its capture back to the driver across
+        the ``collective_rpc`` boundary on the TP>1 path. Returns copies of the dicts, not the live
+        buffers, so a subsequent :meth:`reset` cannot mutate what the caller received.
+        """
+        return {
+            "inputs": dict(self.inputs),
+            "outputs": dict(self.outputs),
+            "topk_ids": self.topk_ids,
+        }
+
     def remove(self) -> None:
         for h in self._handles:
             h.remove()
@@ -521,3 +540,122 @@ class RouterCapture:
 
     def __exit__(self, *exc: object) -> None:
         self.remove()
+
+
+# --------------------------------------------------------------------------------------
+# module discovery — shared by the TP=1 driver path and the TP=2 worker path
+# --------------------------------------------------------------------------------------
+
+
+def discover_router_and_experts(
+    model: Any,
+    *,
+    router_suffix: str = ".mlp.gate",
+    experts_suffix: str = ".mlp.experts",
+    n_expected: int | None = None,
+) -> tuple[list[Any], list[Any], list[str], list[str]]:
+    """Find the per-layer router and experts modules on a live vLLM model, ordered by layer.
+
+    vLLM's internal module names differ from HuggingFace's and must be confirmed on the box, never
+    assumed (the T1.4 analogue) — so this MATCHES by suffix against the live module tree and returns
+    both the modules and their names, for the caller to print and sanity-check. The suffixes come
+    from the model card (``.mlp.gate``/``.mlp.experts`` for OLMoE/Qwen; Gemma-4 routes through
+    ``.router``). Ordering is by the integer in ``layers.<i>.`` so index 0 is the lowest MoE layer.
+    """
+    import re
+
+    named = dict(model.named_modules())
+
+    def layer_of(name: str) -> int:
+        m = re.search(r"layers\.(\d+)\.", name)
+        return int(m.group(1)) if m else -1
+
+    gate_names = sorted(
+        (n for n in named if n.endswith(router_suffix) and layer_of(n) >= 0), key=layer_of
+    )
+    expert_names = sorted(
+        (n for n in named if n.endswith(experts_suffix) and layer_of(n) >= 0), key=layer_of
+    )
+    if not gate_names:
+        raise CaptureError(
+            f"no modules end with router_suffix {router_suffix!r}; the vLLM name differs on this "
+            "model — print model.named_modules() and pass the right suffix"
+        )
+    if len(gate_names) != len(expert_names):
+        raise CaptureError(
+            f"found {len(gate_names)} routers ({router_suffix!r}) but {len(expert_names)} experts "
+            f"({experts_suffix!r}); they must pair one-to-one per MoE layer"
+        )
+    if n_expected is not None and len(gate_names) != n_expected:
+        raise CaptureError(
+            f"expected {n_expected} MoE layers, discovered {len(gate_names)} "
+            f"({router_suffix!r}); check the model card's n_moe_layers or the suffix"
+        )
+    return (
+        [named[n] for n in gate_names],
+        [named[n] for n in expert_names],
+        gate_names,
+        expert_names,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# worker-side entrypoints — the TP>1 path (Python hooks can't cross the worker boundary)
+# --------------------------------------------------------------------------------------
+#
+# At tensor_parallel_size>1 vLLM runs each rank in its own process, so a RouterCapture built in the
+# driver reaches nothing. These four functions are passed to Executor.collective_rpc, which
+# cloudpickles them to every worker and calls them with the worker as the first argument. They
+# install / reset / drain / remove a RouterCapture that lives ON the worker, stashed as an
+# attribute. The router is a ReplicatedLinear, so router_logits (and thus select_experts' topk) are
+# the FULL global selection on every rank — rank 0's drain is complete on its own. (Verify on-box
+# that the captured expert IDs are GLOBAL, not TP-local: vllm-ascend #15451 shows that failure mode
+# for the built-in capturer; the drain-side selection gate would also catch it as a mismatch.)
+#
+# For collective_rpc to resolve these by reference in a spawned worker, the repo must be importable
+# there — set PYTHONPATH to include it BEFORE constructing the LLM (the probe notebook does this).
+
+
+def worker_install_capture(
+    worker: Any,
+    *,
+    router_suffix: str = ".mlp.gate",
+    experts_suffix: str = ".mlp.experts",
+    n_moe_layers: int | None = None,
+) -> dict[str, Any]:
+    """Build and register a RouterCapture on this worker's model. Returns a small ack per rank."""
+    model = worker.model_runner.model
+    routers, experts, gate_names, _ = discover_router_and_experts(
+        model,
+        router_suffix=router_suffix,
+        experts_suffix=experts_suffix,
+        n_expected=n_moe_layers,
+    )
+    cap = RouterCapture(routers, experts_modules=experts)
+    cap.register()
+    worker._moe_capture = cap  # stash so later RPCs on this worker can reach it
+    return {"rank": getattr(worker, "rank", None), "n_gates": len(gate_names),
+            "first_gate": gate_names[0]}
+
+
+def worker_reset_capture(worker: Any) -> None:
+    """Clear the per-document buffers on this worker. Call before each document's prefill."""
+    cap = getattr(worker, "_moe_capture", None)
+    if cap is not None:
+        cap.reset()
+
+
+def worker_drain_capture(worker: Any) -> dict[str, Any] | None:
+    """Return this worker's captured streams (numpy, picklable) for the current document."""
+    cap = getattr(worker, "_moe_capture", None)
+    if cap is None:
+        return None
+    return {"rank": getattr(worker, "rank", None), **cap.drain()}
+
+
+def worker_remove_capture(worker: Any) -> None:
+    """Restore the hooks and the patched staticmethod on this worker."""
+    cap = getattr(worker, "_moe_capture", None)
+    if cap is not None:
+        cap.remove()
+        worker._moe_capture = None
