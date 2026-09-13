@@ -144,6 +144,8 @@ def build_shard(
     manifest = {
         "model": "unit-moe",
         "checkpoint_status": "base",
+        "model_sha256": "a" * 64,
+        "engine_build": "llama_cpp@abc123",
         "gguf_sha256": "a" * 64,
         "llama_cpp_commit": "abc123",
         "run_config_sha256": "b" * 64,

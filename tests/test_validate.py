@@ -967,8 +967,8 @@ def test_a_shard_set_yields_one_report_per_shard_plus_a_trace_level_report(trace
     [
         ("run_config_sha256", "1" * 64),
         ("logit_tensor_used", "ffn_moe_probs_biased"),
-        ("gguf_sha256", "a" * 64),
-        ("llama_cpp_commit", "deadbee"),
+        ("model_sha256", "a" * 64),
+        ("engine_build", "vllm@0.10.2"),
         ("quant", "Q8_0"),
         ("n_experts", 32),
         ("checkpoint_status", "instruct"),

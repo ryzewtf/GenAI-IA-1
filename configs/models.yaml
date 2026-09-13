@@ -56,6 +56,11 @@ models:
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0125, file: olmoe-0125-Q4_K_M.gguf, sha256: 57c420a91615c999acec2ae527244fb43aac04029a4daabda8bd5c85b5e9e10b, size_bytes: 4213512320}
+    # vLLM engine (P1-proven TP=1). router/experts suffixes CONFIRMED on-box (Cell 4, 2026-09-13):
+    # 16 model.layers.{i}.mlp.gate (ReplicatedLinear) + .mlp.experts (FusedMoE). fp16 fits one T4 at
+    # util 0.95 (7B fp16 weights ~12.9 GiB). model_sha256 is the weights identity for the manifest;
+    # null until the T1.1-equivalent step fills it (the P3 notebook resolves the HF revision sha).
+    vllm: {model_id: allenai/OLMoE-1B-7B-0125, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
@@ -246,6 +251,11 @@ models:
     device_plan: {n_gpu: 2, split_mode: layer, tensor_split: [0.5, 0.5]}   # pinned; see T8.5
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/qwen3-30b-a3b, file: qwen3-30b-a3b-Q4_K_M.gguf, sha256: 2f0058c30d5ffb4df32e0f4db41d213c5c4e5dcd580f7e24fa9e4f54daadaeaa, size_bytes: 18556686432}
+    # vLLM engine (P0/P2-proven TP=2). GPTQ-Int4 is THE Turing INT4-MoE format (moe_wna16 kernel);
+    # the fp16 hf_repo (Qwen/Qwen3-30B-A3B) is ~60 GiB and does NOT fit T4x2 — collect the GPTQ repo.
+    # router/experts suffixes CONFIRMED on-box (P2, 2026-09-13): 48 .mlp.gate + .mlp.experts, and
+    # select_experts returned GLOBAL expert ids (no #15451 TP-local slicing). model_sha256: see olmoe.
+    vllm: {model_id: Qwen/Qwen3-30B-A3B-GPTQ-Int4, quant: gptq_int4, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs

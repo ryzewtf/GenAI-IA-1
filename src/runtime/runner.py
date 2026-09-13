@@ -814,6 +814,9 @@ def build_shard_manifest(
         "model": model,
         "corpus": corpus,
         "checkpoint_status": meta.get("checkpoint_status"),
+        # Engine-neutral weights hash (required key); for llama.cpp it IS the gguf hash. gguf_sha256
+        # is kept below as the llama.cpp-specific alias so existing readers are unaffected.
+        "model_sha256": gguf.get("sha256"),
         "gguf_sha256": gguf.get("sha256"),
         "quant": meta.get("quant") or gguf.get("quant"),
         "router_dtype": meta.get("router_dtype"),

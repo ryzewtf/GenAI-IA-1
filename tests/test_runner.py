@@ -876,7 +876,9 @@ def test_a_shard_cannot_be_collected_while_the_gguf_hash_is_still_unknown(
         remote_prefix="traces/unit-moe/unit/shard_00000",
         model_meta={**MODEL_META, "gguf": {"sha256": None}},
     )
-    assert result.status == "failed" and "gguf_sha256" in result.error
+    # gguf.sha256=None leaves both model_sha256 (required, engine-neutral) and gguf_sha256 null;
+    # write_manifest refuses the null required key and names it.
+    assert result.status == "failed" and "model_sha256" in result.error
     assert ledger.completed_ids() == set()
 
 

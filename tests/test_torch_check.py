@@ -79,6 +79,7 @@ def build_shard(tmp_path, hf_logits, *, doc_lengths=(5, 7), layer_map=None, soft
 
     write_manifest(shard, {
         "model": "fixture", "checkpoint_status": "base", "gguf_sha256": "0" * 64,
+        "model_sha256": "0" * 64, "engine_build": "llama_cpp@" + "0" * 40,
         "llama_cpp_commit": "0" * 40, "run_config_sha256": "0" * 64, "quant": "F16",
         "router_dtype": "F32", "logit_tensor_used": "ffn_moe_probs", "corpus": "c",
         "shard_id": 0, "shard_doc_range": [0, len(doc_lengths)], "n_tokens": n_tokens,

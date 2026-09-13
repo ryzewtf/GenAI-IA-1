@@ -256,7 +256,8 @@ def test_split_mask_requires_the_mapping(trace):
     [
         ("run_config_sha256", "1" * 64),
         ("logit_tensor_used", "ffn_moe_logits_biased"),
-        ("gguf_sha256", "a" * 64),
+        ("model_sha256", "a" * 64),
+        ("engine_build", "vllm@0.10.2"),
         ("n_experts", 32),
         ("quant", "Q8_0"),
     ],

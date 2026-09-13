@@ -272,10 +272,23 @@ class RunConfig:
 
     # -- manifest glue ------------------------------------------------------------------
 
+    def engine_build(self) -> str:
+        """Engine-neutral build identity for the manifest — ``<engine>@<version>``.
+
+        The manifest's ``engine_build`` (a required, merge-invariant key) records which engine and
+        version produced the shard. llama.cpp uses the pinned commit; vLLM the pinned version. A
+        shard whose engine_build differs is a different experiment (plan S.3).
+        """
+        if self.engine == "vllm":
+            return f"vllm@{self.build.get('vllm_version')}"
+        return f"llama_cpp@{self.build.get('llama_cpp_commit')}"
+
     def manifest_fields(self) -> dict[str, Any]:
         """The subset of manifest fields this config determines."""
         return {
             "run_config_sha256": self.sha256,
+            "engine_build": self.engine_build(),
+            # Kept for llama.cpp readers; null for vLLM (its build identity is engine_build).
             "llama_cpp_commit": self.build.get("llama_cpp_commit"),
             "hidden_subsample_n": self.capture.get("hidden_subsample_n"),
             "device_plan": {

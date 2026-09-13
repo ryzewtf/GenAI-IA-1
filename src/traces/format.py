@@ -90,11 +90,19 @@ STREAM_FILES = {
 MANIFEST_NAME = "manifest.json"
 
 #: Manifest keys that must be present and non-null on every shard (plan T2.3).
+#
+# `model_sha256` and `engine_build` are ENGINE-NEUTRAL and required on every engine: the study is
+# collected on llama.cpp AND (post-2026-09) vLLM, and neither "which gguf" nor "which llama.cpp
+# commit" is meaningful for a vLLM run that loads safetensors and has no commit. `model_sha256` is
+# the weights hash in whatever format the engine loaded; `engine_build` names the engine and its
+# version ("llama_cpp@7077abbe", "vllm@0.10.2"). The old `gguf_sha256`/`llama_cpp_commit` are kept
+# as OPTIONAL fields (below) so existing llama.cpp readers keep working; they are no longer required
+# because a vLLM shard cannot supply them.
 REQUIRED_MANIFEST_KEYS = (
     "model",
     "checkpoint_status",
-    "gguf_sha256",
-    "llama_cpp_commit",
+    "model_sha256",
+    "engine_build",
     "run_config_sha256",
     "quant",
     "router_dtype",
@@ -129,8 +137,8 @@ SHARD_INVARIANT_KEYS = (
     "model",
     "corpus",
     "run_config_sha256",
-    "gguf_sha256",
-    "llama_cpp_commit",
+    "model_sha256",
+    "engine_build",
     "quant",
     "router_dtype",
     "logit_tensor_used",

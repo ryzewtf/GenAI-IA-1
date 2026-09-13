@@ -176,6 +176,8 @@ def make_synthetic_trace(
         manifest: dict[str, Any] = {
             "model": model,
             "checkpoint_status": "base",
+            "model_sha256": "f" * 64,
+            "engine_build": "llama_cpp@abc123",
             "gguf_sha256": "f" * 64,
             "llama_cpp_commit": "abc123",
             "run_config_sha256": run_config_sha256,
