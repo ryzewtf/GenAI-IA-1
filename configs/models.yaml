@@ -60,7 +60,9 @@ models:
     # 16 model.layers.{i}.mlp.gate (ReplicatedLinear) + .mlp.experts (FusedMoE). fp16 fits one T4 at
     # util 0.95 (7B fp16 weights ~12.9 GiB). model_sha256 is the weights identity for the manifest;
     # null until the T1.1-equivalent step fills it (the P3 notebook resolves the HF revision sha).
-    vllm: {model_id: allenai/OLMoE-1B-7B-0125, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
+    # model_sha256 PINNED from the P3 run (HF revision sha, resolved 2026-09-13) so the manifest
+    # weights identity is frozen and reproducible; the collector uses a set value as-is (no re-resolve).
+    vllm: {model_id: allenai/OLMoE-1B-7B-0125, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: 9b0c1aa87e34a20052389dce1f0cf01da783f654}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
@@ -103,6 +105,10 @@ models:
     # below predate the reconversion and describe an artifact with a different hash: re-confirm
     # them against this file before T3 collection trusts them (invariant I13).
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0125-instruct, file: olmoe-0125-instruct-Q4_K_M.gguf, sha256: c2502f0d9e5ec056c6f5ba87a9fa14aed3cfa7833811a70e9393318b8a86ca7c, size_bytes: 4213512960}
+    # vLLM engine: arch identical to olmoe-0125 (OlmoeForCausalLM, P1/P3-proven). fp16 fits one T4
+    # at util 0.95 (~12.9 GiB). model_sha256 null → collector resolves the HF revision sha on first
+    # real collect, then pin it here.
+    vllm: {model_id: allenai/OLMoE-1B-7B-0125-Instruct, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
     # VERIFIED T1.2 — GATE PASSED. `python -m src.capture.router_audit` found 16 ffn_gate_inp
     # tensors, all F32, in a checkpoint whose experts are Q4_K. The count independently confirms
     # n_moe_layers: 16 with first_k_dense_replace: 0 from the artifact rather than from config.json.
@@ -151,6 +157,10 @@ models:
     device_plan: {n_gpu: 1, split_mode: layer, tensor_split: null}
     config_keys: {experts: num_experts, top_k: num_experts_per_tok, aux_loss: router_aux_loss_coef, nesting: null}
     gguf: {repo: null, kaggle: ryzewtf/moe-panel/gguf/olmoe-0924, file: olmoe-0924-Q4_K_M.gguf, sha256: 9243992f6c421591a027b8740f835318017fb29dbcbb56e435d322c79f238622, size_bytes: 4213512064}
+    # vLLM engine: arch identical to olmoe-0125 (OlmoeForCausalLM, P1/P3-proven). fp16 fits one T4
+    # at util 0.95 (~12.9 GiB). model_sha256 null → collector resolves the HF revision sha on first
+    # real collect, then pin it here.
+    vllm: {model_id: allenai/OLMoE-1B-7B-0924, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
@@ -255,7 +265,7 @@ models:
     # the fp16 hf_repo (Qwen/Qwen3-30B-A3B) is ~60 GiB and does NOT fit T4x2 — collect the GPTQ repo.
     # router/experts suffixes CONFIRMED on-box (P2, 2026-09-13): 48 .mlp.gate + .mlp.experts, and
     # select_experts returned GLOBAL expert ids (no #15451 TP-local slicing). model_sha256: see olmoe.
-    vllm: {model_id: Qwen/Qwen3-30B-A3B-GPTQ-Int4, quant: gptq_int4, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
+    vllm: {model_id: Qwen/Qwen3-30B-A3B-GPTQ-Int4, quant: gptq_int4, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: 9b534e4318b7ebc3c961a839f13eb18b1833f441}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
