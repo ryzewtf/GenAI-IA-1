@@ -204,10 +204,18 @@ class HFBackend:
     token in a published artifact.
     """
 
-    def __init__(self, repo_id: str, repo_type: str = "dataset", *, create: bool = False) -> None:
+    def __init__(
+        self,
+        repo_id: str,
+        repo_type: str = "dataset",
+        *,
+        create: bool = False,
+        private: bool = True,
+    ) -> None:
         self.repo_id = repo_id
         self.repo_type = repo_type
         self._create = bool(create)
+        self._private = bool(private)
         self._api: Any = None
         self._ensured = False
 
@@ -242,8 +250,11 @@ class HFBackend:
             hub = self._hub()
             self._api = hub.HfApi(token=self._token())
             if self._create and not self._ensured:
+                # private only applies when this call actually creates the repo; an existing repo's
+                # visibility is never changed here (exist_ok=True leaves it as-is).
                 self._api.create_repo(
-                    repo_id=self.repo_id, repo_type=self.repo_type, exist_ok=True, private=True
+                    repo_id=self.repo_id, repo_type=self.repo_type, exist_ok=True,
+                    private=self._private,
                 )
                 self._ensured = True
         return self._api

@@ -41,7 +41,13 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..corpus.build import load_corpus
-from ..traces.format import STREAM_FILES, TraceSpec, check_file_sizes, write_manifest
+from ..traces.format import (
+    HIDDEN_INDEX_DTYPE,
+    STREAM_FILES,
+    TraceSpec,
+    check_file_sizes,
+    write_manifest,
+)
 from ..runtime.config import RunConfig
 from ..runtime.runner import (
     ShardPlan,
@@ -314,6 +320,29 @@ def _capture_mask(doc_id: int, n_tokens: int, n_ctx: int, hidden_stride: int) ->
     return [((base + i) % hidden_stride) == 0 for i in range(n_tokens)]
 
 
+def _assert_hidden_index_ascending(path: Path, shard_id: int) -> None:
+    """Refuse a shard whose hidden_index.bin is not strictly ascending (the T5.3 lockstep rule).
+
+    Reads the uint32 stream and raises :class:`CollectError` on the first non-increasing step, so a
+    misordered or mis-indexed shard fails BEFORE upload. Uses numpy (a hard dependency of the trace
+    format) and holds only the one stream, which is tiny (4 bytes per captured token).
+    """
+    import numpy as np
+
+    idx = np.fromfile(path, dtype=HIDDEN_INDEX_DTYPE)
+    if idx.size < 2:
+        return
+    bad = np.flatnonzero(np.diff(idx.astype(np.int64)) <= 0)
+    if bad.size:
+        first = int(bad[0])
+        raise CollectError(
+            f"shard {shard_id}: hidden_index.bin is not strictly ascending "
+            f"({bad.size} violation(s), first at row {first + 1}: "
+            f"{int(idx[first])} -> {int(idx[first + 1])}); documents must be emitted in doc_id "
+            "order so the global index doc_id*n_ctx+pos is monotone. NOT uploading this shard."
+        )
+
+
 def collect_shard(
     engine: Any,
     plan: ShardPlan,
@@ -342,7 +371,11 @@ def collect_shard(
     n_tokens_dropped = 0
     first_truncated_doc: int | None = None
 
-    for doc in docs:
+    # Documents MUST be emitted in ascending doc_id order: the global index is
+    # ``doc_id * n_ctx + pos`` and the reader requires hidden_index strictly ascending within a
+    # shard. plan_shards preserves corpus (interleaved) order, so sort here — the canonical corpus
+    # scatters doc_ids across shards, and iterating file order writes a non-monotone index stream.
+    for doc in sorted(docs, key=lambda d: int(d.doc_id)):
         ids = engine.tokenize(doc.text)
         n = len(ids)
         if n > n_ctx:
@@ -371,6 +404,12 @@ def collect_shard(
 
     for name, parts in blobs.items():
         (out_dir / name).write_bytes(b"".join(parts))
+
+    # Safety net: hidden_index MUST be strictly ascending within the shard, or the reader resolves
+    # the wrong rows and T5.3 rejects the whole set. This catches ANY indexing regression (bad doc
+    # order, a wrong global base, a stride bug) HERE — before upload — instead of after a paid
+    # session's traces are already on HF. Cheap: one pass over the uint32 index stream.
+    _assert_hidden_index_ascending(out_dir / STREAM_FILES["hidden_index"], plan.shard_id)
 
     # The size arithmetic is the last local gate before upload; a short stream never leaves here.
     check_file_sizes(out_dir, spec, n_tokens_total, n_captured_total)
@@ -501,7 +540,9 @@ def build_vllm_manifest(
         "router_dtype": model_meta.get("router_dtype"),
         "logit_tensor_used": model_meta.get("logit_tensor_used"),
         "shard_id": int(plan.shard_id),
-        "shard_doc_range": list(plan.doc_range),
+        # Half-open [min, max+1). plan.doc_range assumes doc_ids arrive sorted; the canonical corpus
+        # interleaves them across shards, so derive the span from the actual id set instead.
+        "shard_doc_range": [int(min(plan.doc_ids)), int(max(plan.doc_ids)) + 1],
         "n_docs": int(stats["n_docs"]),
         "n_tokens": int(stats["n_tokens"]),
         "n_captured": int(stats.get("n_captured", 0)),
@@ -721,6 +762,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--local-root", type=Path, default=None)
     parser.add_argument("--repo-id", default=None)
     parser.add_argument("--remote-root", default=None)
+    parser.add_argument("--public", action="store_true",
+                        help="create the HF trace repo as PUBLIC (world-readable) instead of "
+                             "private — uses the account's large public storage quota. Only "
+                             "applies when the repo is first created; existing repos keep their "
+                             "visibility.")
     parser.add_argument("--log", type=Path, default=repo_root / "results" / "collection_log.csv")
     parser.add_argument("--shards", default=None, help="restrict to '0-19' or '3,7,11'")
     parser.add_argument("--subsample-n", type=int, default=None,
@@ -776,7 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         from ..runtime.upload import HFBackend  # noqa: PLC0415
 
-        backend: StorageBackend = HFBackend(args.repo_id, create=True)
+        backend: StorageBackend = HFBackend(args.repo_id, create=True, private=not args.public)
     else:
         if not args.local_root:
             print("--backend local requires --local-root", file=sys.stderr)

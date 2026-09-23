@@ -22,6 +22,7 @@ from src.capture.vllm_collect import (
     run_vllm_collection,
     spec_and_gating_for,
     validate_vllm_stats,
+    _assert_hidden_index_ascending,
     _capture_mask,
 )
 from src.capture.vllm_trace import gating_from_config, recompute_topk
@@ -29,11 +30,13 @@ from src.runtime.config import RunConfig
 from src.runtime.runner import ShardPlan, plan_shards
 from src.runtime.state import ShardState
 from src.runtime.upload import LocalDirBackend
+from src.traces.reader import TraceReader
 from src.traces.format import (
     HIDDEN_INDEX_DTYPE,
     REQUIRED_MANIFEST_KEYS,
     SHARD_INVARIANT_KEYS,
     STREAM_FILES,
+    TOKEN_DTYPE,
     TraceSpec,
     read_manifest,
 )
@@ -157,6 +160,50 @@ def test_collect_shard_concatenates_streams_and_indexes_globally(tmp_path):
     for did, n in ((0, 4), (1, 3), (2, 5)):
         expected += [did * 64 + p for p in range(n) if (did * 64 + p) % 2 == 0]
     assert idx.tolist() == expected
+
+
+def test_collect_shard_sorts_interleaved_docs_so_index_is_monotone(tmp_path):
+    # The canonical corpus scatters doc_ids across shards, so a shard JSONL arrives in NON-doc_id
+    # order. collect_shard must emit docs in doc_id order or hidden_index is non-monotone and T5.3
+    # rejects the whole set (the real bug this guards). doc_ids deliberately out of order:
+    docs = [(7, "a b c d"), (2, "e f g"), (5, "h i"), (0, "j k l m n")]
+    jsonl = _write_shard_jsonl(tmp_path / "shard.jsonl", docs)
+    plan = _plan(jsonl, docs, hidden_stride=2)
+    out = tmp_path / "shard_00000"
+
+    stats = collect_shard(_FakeEngine(SPEC), plan, spec=SPEC, gating=GATING, n_ctx=64, out_dir=out)
+
+    idx = np.frombuffer((out / STREAM_FILES["hidden_index"]).read_bytes(), dtype=HIDDEN_INDEX_DTYPE)
+    assert np.all(np.diff(idx.astype(np.int64)) > 0)  # strictly ascending despite scrambled input
+    # tokens.bin doc_id column is in ascending order, not the file order [7,2,5,0].
+    tok = np.frombuffer((out / STREAM_FILES["tokens"]).read_bytes(), dtype=TOKEN_DTYPE)
+    seen = [int(d) for d in dict.fromkeys(tok["doc_id"].tolist())]
+    assert seen == [0, 2, 5, 7]
+
+
+def test_collect_shard_guard_rejects_non_monotone_index(tmp_path):
+    # If a future indexing change produced a non-ascending stream, the pre-upload guard must HALT.
+    bad = tmp_path / "bad.bin"
+    np.array([10, 20, 15], dtype=HIDDEN_INDEX_DTYPE).tofile(bad)
+    with pytest.raises(CollectError, match="not strictly ascending"):
+        _assert_hidden_index_ascending(bad, shard_id=3)
+
+    ok = tmp_path / "ok.bin"
+    np.array([10, 20, 30], dtype=HIDDEN_INDEX_DTYPE).tofile(ok)
+    _assert_hidden_index_ascending(ok, shard_id=3)  # must not raise
+
+
+def test_build_vllm_manifest_shard_doc_range_spans_min_to_max(tmp_path):
+    docs = [(7, "a b"), (2, "c d"), (5, "e f")]  # scattered ids
+    jsonl = _write_shard_jsonl(tmp_path / "shard.jsonl", docs)
+    plan = _plan(jsonl, docs, hidden_stride=0)
+    out = tmp_path / "shard_00000"
+    stats = collect_shard(_FakeEngine(SPEC), plan, spec=SPEC, gating=GATING, n_ctx=64, out_dir=out)
+    man = build_vllm_manifest(
+        out, plan, stats, config=RunConfig.load(RUN_VLLM), spec=SPEC, model="m",
+        corpus="unit", model_meta=MODEL_META, n_ctx=64,
+    )
+    assert man["shard_doc_range"] == [2, 8]  # [min, max+1), not file order [7, 6)
 
 
 def test_collect_shard_flags_truncation_and_does_not_write_the_doc(tmp_path):
@@ -285,6 +332,12 @@ def test_run_vllm_collection_local_roundtrip_and_resumes(tmp_path):
     man = json.loads((tmp_path / "traces" / "traces" / "olmoe-0125" / "unit" / "shard_00000"
                       / "manifest.json").read_text())
     assert man["engine_build"] == "vllm@0.10.2"
+
+    # P3 blind spot (the doc-order bug slipped past because nothing opened the multi-shard reader):
+    # the collected set must actually be READABLE end-to-end, not just per-shard valid (T2.3).
+    reader = TraceReader(tmp_path / "traces" / "traces", "olmoe-0125", "unit", validate_sizes=False)
+    rows = reader.captured_rows()  # raises FormatError if hidden_index is not ascending across shards
+    assert rows.size and reader.hidden(0, rows[:2]).shape == (2, SPEC.hidden_dim)
 
     # Resume: a second run skips every shard without re-capturing (T3.6).
     ledger2 = ShardState.load_or_create(scratch / "state.json", "olmoe-0125", "unit", config.sha256)

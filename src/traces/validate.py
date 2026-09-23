@@ -60,7 +60,7 @@ from .format import (
     expected_file_sizes,
     read_manifest,
 )
-from .reader import ShardHandle
+from .reader import ShardHandle, TraceReader
 
 __all__ = [
     "Finding",
@@ -1677,6 +1677,31 @@ def validate_shards(
                     "error",
                     f"duplicate shard id(s) {duplicates}; one shard would shadow the other",
                     {"duplicate_shard_ids": duplicates},
+                )
+            ]
+        )
+
+    # Cross-shard readability. Every per-shard check above works on one ShardHandle and never opens
+    # the multi-shard reader, so a hidden_index that is monotone WITHIN each shard but not across the
+    # concatenated set (docs numbered in fetch order, not write order — T2.3) passes them all yet
+    # makes TraceReader.captured_rows() raise the moment analysis touches hidden states. Exercise
+    # that path here so the trace-level verdict matches what analysis will actually see.
+    trace_dir = Path(shard_dirs[0]).parent  # root/<model>/<corpus>
+    try:
+        reader = TraceReader(
+            trace_dir.parent.parent, trace_dir.parent.name, trace_dir.name, validate_sizes=False
+        )
+        rows = reader.captured_rows()  # triggers the cross-shard ascending invariant
+        if rows.size:
+            reader.hidden(0, rows[:1])  # and prove a lookup resolves
+    except Exception as exc:  # FormatError, KeyError — surface as a trace-level error
+        trace.add(
+            [
+                Finding(
+                    "shard_set",
+                    "error",
+                    f"the multi-shard reader cannot open this trace set: {exc}",
+                    {"error_type": type(exc).__name__},
                 )
             ]
         )

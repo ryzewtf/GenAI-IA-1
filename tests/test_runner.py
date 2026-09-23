@@ -114,6 +114,40 @@ def corpus_path(tmp_path) -> Path:
     return path
 
 
+def _interleaved_corpus(path: Path, *, doc_ids_in_file_order: list[tuple[int, int]]) -> Path:
+    """Write a corpus from (doc_id, shard_id) pairs in the given file order (shards contiguous)."""
+    docs = [
+        Document(
+            doc_id=did, text=f"doc {did} text", domain="prose", lang="en", source="unit",
+            n_tokens_ref=10, split="train", shard_id=sid,
+        )
+        for did, sid in doc_ids_in_file_order
+    ]
+    write_corpus(path, docs, CorpusSpec(name="u", target_tokens=1000, max_doc_tokens=20, shard_tokens=20))
+    return path
+
+
+def test_plan_shards_rejects_doc_ids_not_ascending_across_shards(tmp_path):
+    # The domain-interleaved corpus numbers doc_id in fetch order, so a shard holds scattered ids and
+    # the concatenated order is non-monotone — the trace index doc_id*n_ctx+pos would be unreadable.
+    # Shards stay contiguous in the file (0,0 then 0-shard docs, then shard 1), only the ids scatter.
+    corpus = _interleaved_corpus(
+        tmp_path / "bad.jsonl", doc_ids_in_file_order=[(0, 0), (2, 0), (1, 1), (3, 1)]
+    )
+    with pytest.raises(RunnerError, match="not strictly ascending across the shard order"):
+        plan_shards(corpus, out_root=tmp_path / "s1", subsample_n=SUBSAMPLE_N)
+
+
+def test_plan_shards_accepts_write_order_numbered_corpus(tmp_path):
+    # After renumber_corpus (doc_id = line index) file order == doc_id order, so it ascends.
+    corpus = _interleaved_corpus(
+        tmp_path / "ok.jsonl", doc_ids_in_file_order=[(0, 0), (1, 0), (2, 1), (3, 1)]
+    )
+    plans = plan_shards(corpus, out_root=tmp_path / "s2", subsample_n=SUBSAMPLE_N)
+    flat = [d for p in plans for d in p.doc_ids]
+    assert flat == sorted(flat)
+
+
 @pytest.fixture
 def spec_path(tmp_path) -> Path:
     return SPEC.write(tmp_path / "unit-moe.spec")

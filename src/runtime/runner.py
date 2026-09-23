@@ -282,6 +282,22 @@ def plan_shards(
                 hidden_stride=stride,
             )
         )
+
+    # T2.3: the trace index is doc_id*n_ctx+pos and every reader requires hidden_index to ascend
+    # across the concatenated shards (TraceReader._hidden_token_ids). That holds iff doc_id ascends
+    # in shard-then-file order — i.e. the corpus was numbered in write order. A domain-interleaved
+    # corpus numbered in fetch order violates this and produces traces no reader can open, which a
+    # per-shard capture guard cannot detect. Fail HERE, before the model loads (and in --dry-run),
+    # naming the fix. See scripts/renumber_corpus.py (the mixed-v2 transform).
+    flat = [did for plan in plans for did in plan.doc_ids]
+    bad = next((i for i in range(1, len(flat)) if flat[i] <= flat[i - 1]), None)
+    if bad is not None:
+        raise RunnerError(
+            f"{corpus_path}: doc_ids are not strictly ascending across the shard order "
+            f"(doc {flat[bad]} follows {flat[bad - 1]}); the trace index doc_id*n_ctx+pos would be "
+            "non-monotone and no reader could open the result. Renumber the corpus doc_id to its "
+            "write-order line index first — scripts/renumber_corpus.py (mixed-v2)."
+        )
     return plans
 
 
