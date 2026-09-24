@@ -54,16 +54,20 @@ def sh(args):
 sh([sys.executable, "-m", "pip", "uninstall", "-y",
     "vllm", "torch", "torchvision", "torchaudio", "transformers"])
 sh([sys.executable, "-m", "pip", "install", "-q",
-    f"vllm=={{VLLM_VERSION}}", "transformers==4.55.2"])
+    f"vllm=={{VLLM_VERSION}}", "transformers==4.55.2", "huggingface_hub>=0.34.0,<1.0"])
 # MXFP4 needs a recent triton + the kernels package; without them transformers dequantizes to bf16
-# (~40 GB) and OOMs a T4. Install and record whether they are present.
-sh([sys.executable, "-m", "pip", "install", "-q", "-U", "triton>=3.4", "kernels"])
+# (~40 GB) and OOMs a T4. Constrain huggingface_hub<1.0 IN THE SAME resolve (no -U): kernels'
+# latest pulls hub 2.0.0, which transformers 4.55.2 rejects (needs hub>=0.34,<1.0).
+sh([sys.executable, "-m", "pip", "install", "-q", "triton>=3.4", "kernels",
+    "huggingface_hub>=0.34.0,<1.0"])
+# Belt-and-suspenders: force hub back into range in case anything above bumped it past 1.0.
+sh([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub>=0.34.0,<1.0"])
 sh([sys.executable, "-m", "pip", "uninstall", "-y", "torchvision", "torchaudio"])
 
 chk = subprocess.run(
     [sys.executable, "-c",
-     "import torch, vllm, triton; "
-     "print('IMPORT_OK vllm', vllm.__version__, 'triton', triton.__version__)"],
+     "import torch, vllm, triton, huggingface_hub as h; "
+     "print('IMPORT_OK vllm', vllm.__version__, 'triton', triton.__version__, 'hub', h.__version__)"],
     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 print(chk.stdout, flush=True)
 print(">>> Proceed only if IMPORT_OK printed. DO NOT restart the kernel.")

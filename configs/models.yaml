@@ -204,8 +204,12 @@ models:
     # additive bias (there is no separate gate_inp_b tensor). router_bias_in_output: true tells
     # gating_from_config to use the captured logits as-is; the SelectionMismatch gate (recompute vs
     # vLLM's select_experts, both over g) is the on-box proof. Suffix is .mlp.router (NOT .mlp.gate).
-    # quant mxfp4 is the native release; MXFP4-on-T4 (sm_75) is UNPROVEN — run notebooks/gptoss_probe
-    # (a cheap single-doc T4 load) before any full run. model_sha256 null → collector resolves it.
+    # quant mxfp4 is the native release. MXFP4-on-T4 (sm_75) = CONFIRMED UNSUPPORTED by vLLM (probe
+    # 2026-09-24: "quantization method mxfp4 is not supported ... Minimum capability: 80. Current: 75").
+    # So gpt-oss is collected on the LLAMA.CPP engine instead (native MXFP4 runs on T4; split-engine
+    # like gemma-4, D1) via notebooks/moe_session.ipynb against mixed-v2 → run hash 4fb33286, NOT the
+    # vLLM 1fd87056. This vllm card is kept for a future sm_80+ box; the code (router_bias_in_output,
+    # .mlp.router) is correct and CPU-tested but not proven live.
     vllm: {model_id: openai/gpt-oss-20b, quant: mxfp4, tensor_parallel: 1, gpu_memory_utilization: 0.90, router_suffix: .mlp.router, experts_suffix: .mlp.experts, router_bias_in_output: true, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: attn_post_norm-%d}

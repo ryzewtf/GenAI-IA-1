@@ -101,11 +101,18 @@ GIT_REF = "main"
 RESCAN_NODES = False   # redo T1.4 even if a spec already exists
 
 # --- corpus -----------------------------------------------------------------
-CORPUS_SPEC = "mixed-v1"   # or mixed-v1-scale for the T5.4 4M run
+# CANONICAL corpus is now mixed-v2 (doc_id renumbered to write-order line index so hidden_index
+# ascends across shards — see scripts/renumber_corpus.py and the vLLM panel). The split-engine
+# llama.cpp models (gpt-oss, gemma-4 — D1) MUST collect against the SAME mixed-v2 bytes as the vLLM
+# panel (T4.3), so DO NOT re-fetch: mount the published Kaggle dataset moe-corpus-v2 and point
+# CORPUS_FILE at it below. STAGE='corpus' (a re-fetch) does NOT produce mixed-v2 — leave it unused.
+CORPUS_SPEC = "mixed-v2"   # used only as --corpus-name in the manifest
 TARGET_TOKENS = None       # None = the spec's own target; set an int if Gate Q1 fired
 
 # --- collect / ladder -------------------------------------------------------
-CORPUS_FILE = None     # None = corpora/<CORPUS_SPEC>.jsonl, built by a corpus session
+# The mounted mixed-v2 dataset (Add Input -> moe-corpus-v2). Never None for a real collect: a
+# re-fetch would draw different documents and break byte-identity with the vLLM panel.
+CORPUS_FILE = "/kaggle/input/moe-corpus-v2/mixed-v2.jsonl"
 # The T8.1 ladder collects the SAME model at a second precision, so it cannot use the GGUF that
 # models.yaml records -- that entry names one file per model and the ladder's second rung is not a
 # second model. Point this at the F16 (attach `moe-panel/gguf/olmoe-0125-f16` and give its path
@@ -277,9 +284,25 @@ elif STAGE in ("collect", "ladder"):
     if not Path(corpus).exists():
         raise SystemExit(
             f"{corpus} does not exist. Corpora are gitignored and are NOT carried by the repo -- "
-            "run a STAGE='corpus' session first and attach or rebuild its output. Collecting "
-            "against a corpus built ad hoc in this session would make the traces incomparable "
-            "with every other model's.")
+            "attach the published moe-corpus-v2 dataset (Add Input) so CORPUS_FILE resolves. "
+            "Collecting against a corpus built ad hoc in this session would make the traces "
+            "incomparable with every other model's.")
+
+    # Guard: mixed-v2 MUST have doc_id == line index (write-order), or hidden_index cannot ascend
+    # across shards and TraceReader rejects the whole set (T2.3) — the exact bug that killed the
+    # first vLLM run. A few ms, dependency-free, and it halts BEFORE any paid GPU capture.
+    if CORPUS_SPEC == "mixed-v2":
+        import json as _json
+        with open(corpus, encoding="utf-8") as _fh:
+            for _i, _line in enumerate(_fh):
+                if not _line.strip():
+                    continue
+                _did = _json.loads(_line)["doc_id"]
+                if _did != _i:
+                    raise SystemExit(
+                        f"{corpus} is NOT renumbered: line {_i} has doc_id={_did} (expected {_i}). "
+                        "Mount the mixed-v2 dataset (scripts/renumber_corpus.py), not mixed-v1.")
+        print(f"corpus is renumbered (doc_id == line index) for {_i + 1} docs — mixed-v2 OK")
 
     cmd = [sys.executable, "scripts/kaggle_collect.py", "--model", MODEL, "--corpus", corpus,
            "--corpus-name", CORPUS_SPEC]
