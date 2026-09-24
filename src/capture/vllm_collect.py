@@ -122,8 +122,10 @@ def spec_and_gating_for(meta: Mapping[str, Any]) -> tuple[TraceSpec, GatingOp]:
     """Build the on-disk :class:`TraceSpec` and the :class:`GatingOp` from a models.yaml card.
 
     ``logit_tensor_used`` and ``has_router_bias`` come from the card; the gate reproduces exactly
-    what the study recorded on llama.cpp so ``logits.bin`` stays comparable (softmax for the panel;
-    GPT-OSS additionally biases before selection).
+    what the study recorded on llama.cpp so ``logits.bin`` stays comparable (softmax for the panel).
+    GPT-OSS' router bias needs no special handling here: in vLLM the router is an
+    ``nn.Linear(bias=True)`` whose output — the tensor ``select_experts`` consumes — already contains
+    the bias, so the captured logits are used as-is (see :func:`gating_from_config`).
     """
     spec = TraceSpec(
         n_moe_layers=int(meta["n_moe_layers"]),
@@ -166,12 +168,15 @@ class VLLMCaptureEngine:
         seed: int = 0,
     ) -> None:
         if gating.has_router_bias:
-            # GPT-OSS: selection runs on logits + gate bias. RouterCapture does not yet capture the
-            # bias tensor, and recomputing top-k without it would name experts the model never
-            # routed (§1.6). Refuse loudly rather than write a plausible, wrong topk.bin.
+            # Defensive: a GatingOp built via gating_from_config always has has_router_bias=False,
+            # because in vLLM the router output already contains any additive bias (GPT-OSS'
+            # nn.Linear(bias=True); see gating_from_config). This fires only if a caller hand-builds
+            # a GatingOp carrying a SEPARATE selection bias the hook path cannot feed — recomputing
+            # top-k without it would name experts the model never routed (§1.6), so refuse loudly.
             raise CollectError(
-                f"{model_id}: has_router_bias is set, but vLLM bias capture is not implemented yet. "
-                "Wire the router-bias stream before collecting a biased-router model."
+                f"{model_id}: GatingOp.has_router_bias is set, meaning a separate additive selection "
+                "bias must be supplied per layer — the vLLM hook path does not capture one. Build "
+                "the GatingOp via gating_from_config (router_bias_in_output) or wire a bias stream."
             )
         self.model_id = model_id
         self.tensor_parallel_size = int(tensor_parallel_size)

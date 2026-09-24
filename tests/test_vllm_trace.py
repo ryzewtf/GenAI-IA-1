@@ -141,6 +141,31 @@ def test_router_bias_changes_selection():
         op.selection_scores(logits, None)  # bias declared but not supplied
 
 
+def test_gating_router_bias_in_output_uses_captured_logits_as_is():
+    """GPT-OSS: vLLM's router is nn.Linear(bias=True), so the captured output is already biased.
+
+    gating_from_config must NOT add a bias again — the returned GatingOp has has_router_bias=False so
+    selection_scores/written_logits use the captured logits verbatim. The flag may live top-level or
+    in the vllm: block.
+    """
+    for card in (
+        {"logit_tensor_used": "ffn_moe_probs", "has_router_bias": True,
+         "router_bias_in_output": True},
+        {"logit_tensor_used": "ffn_moe_probs", "has_router_bias": True,
+         "vllm": {"router_bias_in_output": True}},
+    ):
+        op = gating_from_config(card)
+        assert op.softmax and not op.has_router_bias
+        logits = np.array([[2.0, 1.0, 0.0, -1.0]])
+        np.testing.assert_allclose(op.selection_scores(logits, None), logits)  # no re-added bias
+
+
+def test_gating_biased_router_without_flag_raises():
+    """A biased-router card that fails to affirm router_bias_in_output must halt, not guess."""
+    with pytest.raises(CaptureError, match="router_bias_in_output"):
+        gating_from_config({"logit_tensor_used": "ffn_moe_probs", "has_router_bias": True})
+
+
 # -- top-k recomputation ----------------------------------------------------------------------
 
 
@@ -391,6 +416,46 @@ def test_discover_orders_by_layer_number_not_lexically():
     assert gnames[0] == "model.layers.0.mlp.gate"
     assert gnames[-1] == "model.layers.10.mlp.gate"    # numeric ordering, not "model.layers.9..."
     assert enames[-1] == "model.layers.10.mlp.experts"
+
+
+def test_discover_matches_gpt_oss_router_suffix():
+    """GPT-OSS routes through `.mlp.router` (nn.Linear), not `.mlp.gate` — discover by that suffix."""
+    class _M:
+        def named_modules(self):
+            mods = {}
+            for i in range(24):
+                mods[f"model.layers.{i}.mlp.router"] = _FakeGate()
+                mods[f"model.layers.{i}.mlp.experts"] = object()
+            return list(mods.items())
+
+    routers, experts, gnames, enames = discover_router_and_experts(
+        _M(), router_suffix=".mlp.router", experts_suffix=".mlp.experts", n_expected=24)
+    assert len(routers) == 24 and gnames[0] == "model.layers.0.mlp.router"
+    assert gnames[-1] == "model.layers.23.mlp.router"
+
+
+def test_discover_skips_deepseek_dense_layer0_and_shared_experts():
+    """DeepSeek-V2-Lite: layer 0 is a dense MLP (no .mlp.gate/.mlp.experts) and .mlp.shared_experts
+    must not be mistaken for the routed .mlp.experts. discover returns exactly the MoE layers."""
+    class _M:
+        def named_modules(self):
+            mods = {
+                # layer 0 is dense: MergedColumnParallelLinear + down_proj, NO gate/experts.
+                "model.layers.0.mlp.gate_up_proj": object(),
+                "model.layers.0.mlp.down_proj": object(),
+            }
+            for i in range(1, 4):  # 3 MoE layers, model layers 1..3
+                mods[f"model.layers.{i}.mlp.gate"] = _FakeGate()
+                mods[f"model.layers.{i}.mlp.experts"] = object()
+                mods[f"model.layers.{i}.mlp.shared_experts"] = object()  # must be ignored
+            return list(mods.items())
+
+    routers, experts, gnames, enames = discover_router_and_experts(
+        _M(), router_suffix=".mlp.gate", experts_suffix=".mlp.experts", n_expected=3)
+    assert gnames == ["model.layers.1.mlp.gate", "model.layers.2.mlp.gate",
+                      "model.layers.3.mlp.gate"]
+    assert enames == ["model.layers.1.mlp.experts", "model.layers.2.mlp.experts",
+                      "model.layers.3.mlp.experts"]  # no shared_experts, no dense layer 0
 
 
 def test_discover_raises_on_bad_suffix_and_wrong_count():

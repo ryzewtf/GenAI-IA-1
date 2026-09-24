@@ -199,6 +199,14 @@ models:
     # bias and T3.2's PyTorch cross-check now compare against the weights as released. T8.4 still
     # exempts this checkpoint from the precision ladder — there is no uncompressed reference to
     # ladder against — but that is a property of the release, not of anything we did to it.
+    # vLLM engine (Tier 2). In vLLM the router is self.mlp.router = nn.Linear(hidden, 32, bias=True):
+    # `g = router(x); experts(router_logits=g)`, so the captured router OUTPUT already contains the
+    # additive bias (there is no separate gate_inp_b tensor). router_bias_in_output: true tells
+    # gating_from_config to use the captured logits as-is; the SelectionMismatch gate (recompute vs
+    # vLLM's select_experts, both over g) is the on-box proof. Suffix is .mlp.router (NOT .mlp.gate).
+    # quant mxfp4 is the native release; MXFP4-on-T4 (sm_75) is UNPROVEN — run notebooks/gptoss_probe
+    # (a cheap single-doc T4 load) before any full run. model_sha256 null → collector resolves it.
+    vllm: {model_id: openai/gpt-oss-20b, quant: mxfp4, tensor_parallel: 1, gpu_memory_utilization: 0.90, router_suffix: .mlp.router, experts_suffix: .mlp.experts, router_bias_in_output: true, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: attn_post_norm-%d}
     logit_tensor_used: ffn_moe_probs
@@ -239,6 +247,15 @@ models:
     # is dense, trace layer 0 is model layer 1), so a converter that renumbered blocks would show
     # up there first. That check is still worth running: it now tests our converter rather than
     # someone else's, which is the version of the question that matters.
+    # vLLM engine (Tier 2). No Turing-viable public INT4 exists (D2), so SELF-QUANTIZE to W4A16 with
+    # GPTQModel, keeping the router fp16 (dynamic negative-match r"-:.*\.mlp\.gate$" — scripts/
+    # quantize_deepseek.py) → repo Ryze242005/DeepSeek-V2-Lite-w4a16-gptq. TP=1 fits one T4 (~8 GB).
+    # Layer-0 dense gap: first_k_dense_replace=1 → model layer 0 has no .mlp.gate/.mlp.experts, so
+    # discover_router_and_experts returns the 26 MoE modules (model layers 1..26); moe_layer_offset=1
+    # already drives layer_index_map. Shared experts (.mlp.shared_experts) are NOT matched by the
+    # suffixes and stay quantized like routed experts (only the router gate is fp16). model_sha256
+    # null until the self-quant repo exists → collector resolves + pin.
+    vllm: {model_id: Ryze242005/DeepSeek-V2-Lite-w4a16-gptq, quant: gptq_int4, tensor_parallel: 1, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs

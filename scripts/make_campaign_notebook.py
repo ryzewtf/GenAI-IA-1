@@ -175,6 +175,8 @@ COLLECT_SRC = f'''# ============================================================
 # Cell 5 — collect ONE model against the full corpus and upload to the new vLLM repo.
 # ============================================================================
 # Tier-1 order: olmoe-0125 -> olmoe-0125-instruct -> olmoe-0924 -> qwen3-30b-a3b.
+# Tier-2 (same notebook, by MODEL_KEY): gpt-oss-20b (run notebooks/gptoss_probe FIRST — MXFP4-on-T4
+# is unproven) and deepseek-v2-lite (run notebooks/quantize_deepseek FIRST to build the W4A16 repo).
 MODEL_KEY = "olmoe-0125"     # <<< set this per session
 TRACE_REPO = "{TRACE_REPO}"  # new repo; old llama.cpp traces untouched (D3)
 

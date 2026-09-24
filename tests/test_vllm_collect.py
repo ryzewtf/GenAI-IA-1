@@ -206,6 +206,32 @@ def test_build_vllm_manifest_shard_doc_range_spans_min_to_max(tmp_path):
     assert man["shard_doc_range"] == [2, 8]  # [min, max+1), not file order [7, 6)
 
 
+def test_build_vllm_manifest_layer_index_map_honors_moe_layer_offset(tmp_path):
+    """DeepSeek-V2-Lite: layer 0 is dense (first_k_dense_replace=1), so trace layer i == model layer
+    i+1. moe_layer_offset=1 must shift layer_index_map, or every per-depth result is off by one."""
+    docs = [(0, "a b"), (1, "c d")]
+    jsonl = _write_shard_jsonl(tmp_path / "shard.jsonl", docs)
+    plan = _plan(jsonl, docs, hidden_stride=0)
+    out = tmp_path / "shard_00000"
+    stats = collect_shard(_FakeEngine(SPEC), plan, spec=SPEC, gating=GATING, n_ctx=64, out_dir=out)
+    meta = {**MODEL_META, "moe_layer_offset": 1}
+    man = build_vllm_manifest(
+        out, plan, stats, config=RunConfig.load(RUN_VLLM), spec=SPEC, model="deepseek-v2-lite",
+        corpus="unit", model_meta=meta, n_ctx=64,
+    )
+    assert man["layer_index_map"] == [1, 2, 3, 4]  # trace 0..3 -> model 1..4, not 0..3
+
+
+def test_spec_and_gating_for_gpt_oss_style_biased_router_in_output():
+    """A GPT-OSS-shaped card (has_router_bias + router_bias_in_output in the vllm block) builds a
+    spec+gating with no separate bias — the captured router output is the selection tensor."""
+    meta = {**MODEL_META, "has_router_bias": True,
+            "vllm": {**MODEL_META["vllm"], "router_bias_in_output": True}}
+    spec, gating = spec_and_gating_for(meta)
+    assert spec == SPEC
+    assert gating.softmax and not gating.has_router_bias
+
+
 def test_collect_shard_flags_truncation_and_does_not_write_the_doc(tmp_path):
     docs = [(0, "a b c"), (1, "w1 w2 w3 w4 w5 w6 w7 w8 w9 w10")]  # doc 1 has 10 tokens
     jsonl = _write_shard_jsonl(tmp_path / "shard.jsonl", docs)

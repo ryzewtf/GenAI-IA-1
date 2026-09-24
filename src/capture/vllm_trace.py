@@ -102,9 +102,14 @@ class GatingOp:
     k/(k+1) MARGIN differs, and the margin is the measurement (T8.2). So logits.bin must hold the
     same transform the study recorded.
 
-    ``has_router_bias`` (GPT-OSS' ``gate_inp_b``) is added to the raw logits BEFORE softmax and
-    before selection — it is not order-preserving, so it changes topk.bin too, and recomputed top-k
-    that ignored it would name experts the model never routed. It is applied in both places here.
+    ``has_router_bias`` supports a SEPARATE additive bias supplied at ``put_layer`` time (a bias
+    tensor the hook captured apart from the logits). It is added to the raw logits BEFORE softmax
+    and before selection — not order-preserving, so it changes topk.bin too. It is retained for
+    generality, but the vLLM hook path never needs it: see :func:`gating_from_config`. In vLLM the
+    router is an ``nn.Linear(bias=True)`` (GPT-OSS: ``self.mlp.router``), so its forward output —
+    the tensor ``select_experts`` consumes — ALREADY contains the additive bias. There is no
+    separate ``gate_inp_b`` tensor to capture, exactly as llama.cpp's ``ffn_moe_probs`` node was
+    already post-bias. So captured logits are used as-is and this flag stays ``False`` for the panel.
     """
 
     softmax: bool
@@ -144,8 +149,20 @@ def gating_from_config(config: Mapping[str, Any]) -> GatingOp:
 
     The panel's ``post_topk`` field describes what happens AFTER selection (normalization over the
     chosen experts) and does not affect either stream here. What matters for logits.bin is that
-    ``logit_tensor_used`` is ``ffn_moe_probs`` (softmax output) for every model, and that GPT-OSS
-    additionally has a pre-selection router bias.
+    ``logit_tensor_used`` is ``ffn_moe_probs`` (softmax output) for every model.
+
+    Router bias, and why the returned GatingOp always has ``has_router_bias=False``
+    -------------------------------------------------------------------------------
+    GPT-OSS has a router bias, but in vLLM its router is ``self.mlp.router`` = an
+    ``nn.Linear(bias=True)`` and the block does ``g = self.router(x); experts(router_logits=g)`` —
+    so the tensor ``select_experts`` consumes ALREADY contains the additive bias (there is no
+    separate ``gate_inp_b`` to capture, exactly as llama.cpp's ``ffn_moe_probs`` node was already
+    post-bias). The captured router output is therefore the exact selection tensor, and no separate
+    additive step is applied here. A model card that sets ``has_router_bias: true`` MUST also set
+    ``router_bias_in_output: true`` (top-level or in the ``vllm:`` block) to affirm the bias is baked
+    into the captured logits; otherwise this raises, because a genuine SEPARATE selection bias
+    (e.g. DeepSeek-V3's ``e_score_correction_bias``, applied inside ``select_experts``) is not
+    captured by the hook path and would silently name experts the model never routed.
     """
     used = config.get("logit_tensor_used")
     if not used:
@@ -158,9 +175,24 @@ def gating_from_config(config: Mapping[str, Any]) -> GatingOp:
             f"logit_tensor_used={used!r} is neither the raw logits nor the softmax probs; the "
             "vLLM hook path only knows how to reproduce those two. Extend GatingOp before using it."
         )
+    arch_bias = bool(config.get("has_router_bias", False))
+    vllm_block = config.get("vllm") or {}
+    bias_in_output = bool(
+        config.get("router_bias_in_output", vllm_block.get("router_bias_in_output", False))
+    )
+    if arch_bias and not bias_in_output:
+        raise CaptureError(
+            "has_router_bias is set but router_bias_in_output is not. In vLLM the router is an "
+            "nn.Linear(bias=True), so its forward output already contains the additive bias — set "
+            "router_bias_in_output: true on the model card so the captured logits are used as-is. "
+            "If instead the model applies a SEPARATE selection bias inside select_experts "
+            "(DeepSeek-V3 e_score_correction_bias), the hook path does not capture it yet and must "
+            "be extended before this model can be collected."
+        )
     return GatingOp(
         softmax=(used == "ffn_moe_probs"),
-        has_router_bias=bool(config.get("has_router_bias", False)),
+        # Always False: the captured router output is the selection tensor (bias, if any, baked in).
+        has_router_bias=False,
         logit_tensor_used=used,
     )
 
