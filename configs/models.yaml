@@ -108,7 +108,7 @@ models:
     # vLLM engine: arch identical to olmoe-0125 (OlmoeForCausalLM, P1/P3-proven). fp16 fits one T4
     # at util 0.95 (~12.9 GiB). model_sha256 null → collector resolves the HF revision sha on first
     # real collect, then pin it here.
-    vllm: {model_id: allenai/OLMoE-1B-7B-0125-Instruct, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
+    vllm: {model_id: allenai/OLMoE-1B-7B-0125-Instruct, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e}
     # VERIFIED T1.2 — GATE PASSED. `python -m src.capture.router_audit` found 16 ffn_gate_inp
     # tensors, all F32, in a checkpoint whose experts are Q4_K. The count independently confirms
     # n_moe_layers: 16 with first_k_dense_replace: 0 from the artifact rather than from config.json.
@@ -160,7 +160,7 @@ models:
     # vLLM engine: arch identical to olmoe-0125 (OlmoeForCausalLM, P1/P3-proven). fp16 fits one T4
     # at util 0.95 (~12.9 GiB). model_sha256 null → collector resolves the HF revision sha on first
     # real collect, then pin it here.
-    vllm: {model_id: allenai/OLMoE-1B-7B-0924, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
+    vllm: {model_id: allenai/OLMoE-1B-7B-0924, quant: fp16, tensor_parallel: 1, gpu_memory_utilization: 0.95, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: 6d84c48581ece794365f2b8e9cfb043c68ade9c5}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
