@@ -282,11 +282,27 @@ elif STAGE in ("collect", "ladder"):
 
     corpus = CORPUS_FILE or f"corpora/{CORPUS_SPEC}.jsonl"
     if not Path(corpus).exists():
-        raise SystemExit(
-            f"{corpus} does not exist. Corpora are gitignored and are NOT carried by the repo -- "
-            "attach the published moe-corpus-v2 dataset (Add Input) so CORPUS_FILE resolves. "
-            "Collecting against a corpus built ad hoc in this session would make the traces "
-            "incomparable with every other model's.")
+        # Kaggle mounts a dataset under a layout we cannot predict from here (/kaggle/input/<slug>/
+        # vs /kaggle/input/datasets/<owner>/<slug>/), so resolve by the filename anywhere under
+        # /kaggle/input -- the same recursive search find_attached_gguf uses for the GGUF. This
+        # turns a path-format mismatch from a halted session into a no-op; the renumber guard below
+        # still proves we found the RIGHT (mixed-v2) corpus.
+        _want = Path(corpus).name
+        _hits = sorted(str(p) for p in Path("/kaggle/input").rglob(_want)) \
+            if Path("/kaggle/input").exists() else []
+        if len(_hits) == 1:
+            print(f"CORPUS_FILE {corpus} not present; found mounted copy {_hits[0]}")
+            corpus = _hits[0]
+        elif len(_hits) > 1:
+            raise SystemExit(
+                f"{corpus} not present and {len(_hits)} copies of {_want} are mounted under "
+                f"/kaggle/input: {_hits}. Set CORPUS_FILE to the right one.")
+        else:
+            raise SystemExit(
+                f"{corpus} does not exist and no {_want} is mounted under /kaggle/input. Corpora "
+                "are gitignored and NOT carried by the repo -- attach the published moe-corpus-v2 "
+                "dataset (Add Input). Collecting against a corpus built ad hoc in this session "
+                "would make the traces incomparable with every other model's.")
 
     # Guard: mixed-v2 MUST have doc_id == line index (write-order), or hidden_index cannot ascend
     # across shards and TraceReader rejects the whole set (T2.3) — the exact bug that killed the
