@@ -95,7 +95,7 @@ MODEL = "all"
 # A branch name tracks; a commit SHA pins. Pin for anything whose output goes in
 # the paper: `run_config_sha256` records the llama.cpp commit, but nothing else
 # records which version of the *analysis* code produced a number.
-GIT_REF = "main"
+GIT_REF = "VLLM_PORT"
 
 # --- gates ------------------------------------------------------------------
 RESCAN_NODES = False   # redo T1.4 even if a spec already exists
