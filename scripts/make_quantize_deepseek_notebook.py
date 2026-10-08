@@ -17,10 +17,11 @@ from pathlib import Path
 OUT = Path(__file__).resolve().parents[1] / "notebooks" / "quantize_deepseek.ipynb"
 REPO_ID = "Ryze242005/DeepSeek-V2-Lite-w4a16-gptq"
 
-HEADER_MD = f"""# DeepSeek-V2-Lite -> W4A16 (GPTQ, router fp16) — one-time quantization
+HEADER_MD = f"""# DeepSeek-V2-Lite -> W4A16 (GPTQ via llm-compressor, router fp16) — one-time quantization
 
-Self-quantizes the routed experts to 4-bit and keeps the router in fp16, then pushes to
-`{REPO_ID}` (private). See scripts/quantize_deepseek.py and configs/models.yaml (deepseek vllm block).
+Self-quantizes the routed experts to 4-bit and keeps the router (+lm_head) in fp16, then pushes to
+`{REPO_ID}` (private, compressed-tensors). Uses **llm-compressor**, not GPTQModel (whose CUDA kernels
+fail to compile on the Kaggle py3.13 image). See scripts/quantize_deepseek.py and configs/models.yaml.
 
 **Before running:** GPU **T4 x2**, **Internet On**, **Add Input -> the mixed-v2 corpus dataset**
 (calibration), and Kaggle **Secrets**: `HF_TOKEN` (write) + `GITHUB_TOKEN`. One-time; paste back the
@@ -35,25 +36,46 @@ print(subprocess.run(
 print("EXPECT two rows, compute_cap 7.5.")
 '''
 
-INSTALL_SRC = '''# Cell 2 — install GPTQModel + deps. Do NOT restart the kernel after.
+INSTALL_SRC = '''# Cell 2 — install llm-compressor + pin transformers. Do NOT restart the kernel after.
+# PIN RATIONALE (load-bearing):
+#  * llmcompressor==0.13.0 is a PURE-PYTHON wheel (no CUDA compile) — this is the whole reason we use
+#    it instead of GPTQModel, whose sdist kernels fail to build on the Kaggle py3.13 image. 0.13.0 is
+#    the newest release still pinning transformers>=4.56.1,<=4.57.6 (0.14.0 jumped to transformers 5).
+#  * transformers==4.57.6 (inside that pin) is load-bearing twice over: transformers 5.0 REMOVED
+#    `is_torch_fx_available`, which DeepSeek-V2-Lite's trust_remote_code modeling imports, AND v5
+#    silently mis-tokenizes DeepSeek — which would corrupt calibration. 4.57.6 keeps both correct.
 import subprocess, sys
 
 
 def sh(args):
     print("$", " ".join(args), flush=True)
     p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print((p.stdout or "")[-3000:], flush=True)
+    print((p.stdout or "")[-4000:], flush=True)
     print("exit:", p.returncode, flush=True)
     return p.returncode
 
 
-sh([sys.executable, "-m", "pip", "install", "-q", "-U", "gptqmodel", "--no-build-isolation"])
-sh([sys.executable, "-m", "pip", "install", "-q", "transformers==4.55.2", "accelerate", "datasets"])
+# Pure-python wheel: no --no-build-isolation, no compiler, no ninja. Pin transformers in the same
+# resolve so llmcompressor's own pin can't drag in a different one.
+rc = sh([sys.executable, "-m", "pip", "install", "-q",
+         "llmcompressor==0.13.0", "transformers==4.57.6"])
+if rc != 0:
+    raise SystemExit(
+        "pip install FAILED (exit %d above) — read the tail for the cause (usually a transformers or "
+        "torch pin conflict). Do NOT run the quant cell until this prints IMPORT_OK." % rc)
 chk = subprocess.run(
-    [sys.executable, "-c", "import gptqmodel, torch; print('IMPORT_OK', gptqmodel.__version__)"],
+    [sys.executable, "-c",
+     "import llmcompressor, transformers, torch; "
+     "from transformers.utils import is_torch_fx_available; "
+     "from llmcompressor.modifiers.quantization import GPTQModifier; "
+     "print('IMPORT_OK llmcompressor', llmcompressor.__version__, 'transformers', "
+     "transformers.__version__, 'torch', torch.__version__, "
+     "'fx_helper_present', callable(is_torch_fx_available))"],
     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 print(chk.stdout, flush=True)
-print(">>> Proceed only if IMPORT_OK printed. DO NOT restart the kernel.")
+if "IMPORT_OK" not in chk.stdout:
+    raise SystemExit("llmcompressor did not import after install — see the error above; do not proceed.")
+print(">>> Proceed only if IMPORT_OK printed AND fx_helper_present=True. DO NOT restart the kernel.")
 '''
 
 REPO_SRC = '''# Cell 3 — clone the repo, put it on sys.path + PYTHONPATH.
@@ -106,7 +128,16 @@ import os
 from pathlib import Path
 
 CORPUS = Path("/kaggle/input/moe-corpus-v2/mixed-v2.jsonl")
-assert CORPUS.exists(), f"{CORPUS} not found — Add Input -> the mixed-v2 dataset"
+if not CORPUS.exists():
+    # Kaggle mounts a dataset under an unpredictable layout (/kaggle/input/<slug>/ vs
+    # /kaggle/input/datasets/<owner>/<slug>/), so resolve by filename anywhere under /kaggle/input.
+    _hits = sorted(Path("/kaggle/input").rglob("mixed-v2.jsonl")) \
+        if Path("/kaggle/input").exists() else []
+    assert len(_hits) == 1, (
+        f"{CORPUS} not found and {len(_hits)} copies of mixed-v2.jsonl under /kaggle/input "
+        f"({_hits}) — Add Input -> the mixed-v2 dataset, or set CORPUS to the right one.")
+    CORPUS = _hits[0]
+    print("CORPUS hardcoded path absent; found mounted copy", CORPUS)
 print("calib corpus:", CORPUS, f"({CORPUS.stat().st_size/1e6:.1f} MB)")
 try:
     from kaggle_secrets import UserSecretsClient

@@ -143,8 +143,18 @@ from pathlib import Path
 # The corpus MUST be the mounted Kaggle dataset — never re-fetched (T4.3 byte-identity).
 CORPUS = Path("/kaggle/input/moe-corpus-v2/mixed-v2.jsonl")
 CORPUS_NAME = "mixed-v2"
-assert CORPUS.exists(), (
-    f"{CORPUS} not found — Add Input -> the mixed-v2 dataset (Internet On won't fetch it for you)")
+if not CORPUS.exists():
+    # Kaggle mounts a dataset under an unpredictable layout (/kaggle/input/<slug>/ vs
+    # /kaggle/input/datasets/<owner>/<slug>/), so resolve by filename anywhere under /kaggle/input.
+    # The renumber guard below still proves we found the RIGHT (mixed-v2) corpus.
+    _hits = sorted(Path("/kaggle/input").rglob("mixed-v2.jsonl")) \
+        if Path("/kaggle/input").exists() else []
+    if len(_hits) != 1:
+        raise SystemExit(
+            f"{CORPUS} not found and {len(_hits)} copies of mixed-v2.jsonl under /kaggle/input "
+            f"({_hits}) — Add Input -> the mixed-v2 dataset, or set CORPUS to the right one.")
+    CORPUS = _hits[0]
+    print("CORPUS hardcoded path absent; found mounted copy", CORPUS)
 print("corpus:", CORPUS, f"({CORPUS.stat().st_size/1e6:.1f} MB)")
 
 # Guard: mixed-v2 MUST have doc_id == line index (write-order). Mounting mixed-v1 (fetch-order) or
