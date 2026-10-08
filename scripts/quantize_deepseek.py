@@ -156,8 +156,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.model_id, torch_dtype="auto", trust_remote_code=True)
 
     ds = Dataset.from_dict({"text": texts})
-    recipe = GPTQModifier(
-        targets="Linear", scheme="W4A16", ignore=IGNORE_PATTERNS, group_size=args.group_size)
+    # The "W4A16" scheme preset already fixes 4-bit group-128 weight quant — GPTQModifier rejects a
+    # separate group_size kwarg (pydantic extra_forbidden). 128 is exactly what we want; to use a
+    # different group size you would pass a full config_groups=QuantizationScheme(...) instead.
+    if args.group_size != 128:
+        raise SystemExit(f"--group-size {args.group_size}: the W4A16 scheme is fixed at group_size=128; "
+                         "pass config_groups in the recipe to change it.")
+    recipe = GPTQModifier(targets="Linear", scheme="W4A16", ignore=IGNORE_PATTERNS)
 
     oneshot(
         model=model,
