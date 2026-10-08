@@ -45,7 +45,14 @@ from typing import Sequence
 # pattern matches ONLY the MoE gate, never ``.mlp.gate_proj``/``.mlp.gate_up_proj`` (which start the
 # same way). ``lm_head`` is kept fp16 too (standard — a 4-bit output head produces gibberish).
 ROUTER_IGNORE_REGEX = r"re:.*\.mlp\.gate$"
-IGNORE_PATTERNS = ["lm_head", ROUTER_IGNORE_REGEX]
+# DeepSeek-V2-Lite's DENSE layer 0 (first_k_dense_replace=1) FFN has intermediate_size=10944, whose
+# down_proj has 10944 input columns — NOT divisible by the group size 128 (10944/128 = 85.5), so
+# group-128 W4A16 cannot tile it and llm-compressor refuses. The MoE experts use moe_intermediate
+# 1408 = 11*128, which divides fine, so only this one dense layer is affected. Layer 0 is dense (not a
+# MoE layer) and is excluded from the trace anyway (moe_layer_offset=1 → trace layer 0 == model layer
+# 1), so keeping its FFN fp16 is inconsequential to the study. Match its gate/up/down projections.
+DENSE_LAYER0_IGNORE_REGEX = r"re:model\.layers\.0\.mlp\.\w+_proj$"
+IGNORE_PATTERNS = ["lm_head", ROUTER_IGNORE_REGEX, DENSE_LAYER0_IGNORE_REGEX]
 
 
 def router_gate_is_ignored(module_name: str) -> bool:
@@ -56,6 +63,23 @@ def router_gate_is_ignored(module_name: str) -> bool:
     """
     body = ROUTER_IGNORE_REGEX[3:] if ROUTER_IGNORE_REGEX.startswith("re:") else ROUTER_IGNORE_REGEX
     return re.fullmatch(body, module_name) is not None
+
+
+def module_is_ignored(module_name: str) -> bool:
+    """True iff ``module_name`` is kept fp16 by ANY entry in :data:`IGNORE_PATTERNS`.
+
+    Mirrors llm-compressor's matching for the whole ignore list: an ``re:``-prefixed entry is a regex
+    (full-match), a bare entry matches the module's final ``.``-segment (so ``lm_head`` matches
+    ``model.lm_head``). Pure/dependency-free so the full fp16 set is unit-testable without a GPU.
+    """
+    leaf = module_name.rsplit(".", 1)[-1]
+    for pat in IGNORE_PATTERNS:
+        if pat.startswith("re:"):
+            if re.fullmatch(pat[3:], module_name) is not None:
+                return True
+        elif pat == module_name or pat == leaf:
+            return True
+    return False
 
 
 def load_calibration_texts(corpus: Path | None, n_samples: int) -> list[str]:
