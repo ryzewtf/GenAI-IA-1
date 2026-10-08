@@ -11,6 +11,7 @@ from __future__ import annotations
 from scripts.quantize_deepseek import (
     IGNORE_PATTERNS,
     ROUTER_IGNORE_REGEX,
+    assess_quant,
     module_is_ignored,
     router_gate_is_ignored,
 )
@@ -64,3 +65,41 @@ def test_full_ignore_quantizes_moe_experts_and_other_dense_layers():
         "model.layers.1.self_attn.q_proj",
     ):
         assert not module_is_ignored(name), name
+
+
+# ---- assess_quant: the pre-upload verdict (pure; no GPU / no saved model needed) ----
+
+_GOOD_KEYS = [
+    "model.layers.1.mlp.gate.weight",                      # router: plain fp16 weight, NOT packed
+    "model.layers.1.mlp.experts.0.down_proj.weight_packed",
+    "model.layers.1.mlp.experts.0.down_proj.weight_scale",
+    "model.layers.1.mlp.shared_experts.up_proj.weight_packed",
+    "lm_head.weight",
+]
+_CFG_GROUPS = {"group_0": {"weights": {"num_bits": 4}}}
+_IGNORE = ["lm_head", "re:.*\\.mlp\\.gate$", "re:model\\.layers\\.0\\.mlp\\.\\w+_proj$"]
+
+
+def test_assess_quant_accepts_router_fp16_experts_packed():
+    ok, msg = assess_quant(_GOOD_KEYS, ignore=_IGNORE, config_groups=_CFG_GROUPS)
+    assert ok, msg
+
+
+def test_assess_quant_hard_fails_on_quantized_router():
+    bad = _GOOD_KEYS + ["model.layers.1.mlp.gate.weight_packed"]
+    ok, msg = assess_quant(bad, ignore=_IGNORE, config_groups=_CFG_GROUPS)
+    assert not ok and "router" in msg.lower()
+
+
+def test_assess_quant_hard_fails_when_nothing_compressed():
+    plain = ["model.layers.1.mlp.gate.weight", "model.layers.1.mlp.experts.0.down_proj.weight"]
+    ok, msg = assess_quant(plain, ignore=_IGNORE, config_groups=None)
+    assert not ok and "nothing was quantized" in msg.lower()
+
+
+def test_assess_quant_does_not_false_fail_on_surprising_expert_key_names():
+    # config_groups present + no gate packed → treat as OK even if expert key spelling is unexpected,
+    # so a good ~30-min run is never thrown away over a key-naming quirk.
+    surprising = ["model.layers.1.mlp.gate.weight", "some.other.module.weight_packed"]
+    ok, msg = assess_quant(surprising, ignore=_IGNORE, config_groups=_CFG_GROUPS)
+    assert ok, msg

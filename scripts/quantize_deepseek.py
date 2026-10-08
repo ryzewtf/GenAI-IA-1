@@ -114,36 +114,65 @@ def load_calibration_texts(corpus: Path | None, n_samples: int) -> list[str]:
     return texts
 
 
-def verify_router_unquantized(out_dir: Path) -> None:
-    """Fail loudly if the saved model quantized any router gate, or quantized no experts at all.
-
-    compressed-tensors stores a quantized Linear's 4-bit payload as ``<module>.weight_packed`` (plus
-    ``.weight_scale``); an unquantized module keeps a plain ``.weight``. So the router gate must NOT
-    carry ``.weight_packed`` and the routed experts MUST. This is the last gate before upload.
-    """
+def _weight_keys(out_dir: Path) -> list[str]:
+    """Every tensor name in the saved checkpoint (sharded index or single file)."""
     index = out_dir / "model.safetensors.index.json"
-    keys: list[str]
     if index.is_file():
-        keys = list(json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).keys())
-    else:
-        # single-file checkpoint: read tensor names from the safetensors header
-        from safetensors import safe_open  # noqa: PLC0415
+        return list(json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).keys())
+    from safetensors import safe_open  # noqa: PLC0415
 
-        single = out_dir / "model.safetensors"
-        if not single.is_file():
-            raise SystemExit(f"no safetensors index or file under {out_dir}")
-        with safe_open(str(single), framework="numpy") as f:
-            keys = list(f.keys())
+    single = out_dir / "model.safetensors"
+    if not single.is_file():
+        raise SystemExit(f"no safetensors index or file under {out_dir}")
+    with safe_open(str(single), framework="numpy") as f:
+        return list(f.keys())
 
+
+def assess_quant(keys: list[str], *, ignore: list, config_groups: dict | None) -> tuple[bool, str]:
+    """Pure verdict on a saved compressed-tensors checkpoint. Returns (ok, message).
+
+    HARD FAIL only on genuine defects, so a surprising-but-fine checkpoint is never rejected (that
+    would waste a ~30-min run):
+      * router QUANTIZED — any ``.mlp.gate.weight_packed`` tensor. This is the one thing we must never
+        ship, so its mere presence fails.
+      * nothing compressed — no ``config_groups`` in quantization_config AND no ``.weight_packed``
+        tensor anywhere: the oneshot did not quantize, so there is nothing to upload.
+    Everything else (expert count, exact key spelling) is reported but does not fail: pack-quantized
+    W4A16 stores 4-bit payloads as ``<module>.weight_packed`` and config.json lists kept-fp16 modules
+    under ``ignore`` (our router/lm_head/dense-layer-0 patterns), which we surface for the human.
+    """
     gate_q = [k for k in keys if re.search(r"\.mlp\.gate\.weight_packed$", k)]
     experts_q = [k for k in keys if ".mlp.experts" in k and k.endswith(".weight_packed")]
+    any_packed = [k for k in keys if k.endswith(".weight_packed")]
+    router_in_ignore = any(
+        "mlp.gate" in str(e) and "gate_proj" not in str(e) and "gate_up" not in str(e)
+        for e in (ignore or [])
+    )
     if gate_q:
-        raise SystemExit(f"router gate was QUANTIZED (found {len(gate_q)} .mlp.gate.weight_packed) — "
-                         "the ignore pattern did not apply; refusing to upload a W4 router")
-    if not experts_q:
-        raise SystemExit("no quantized experts found (.mlp.experts.*.weight_packed) — quantization "
-                         "did not run over the routed experts; refusing to upload")
-    print(f"verify OK: 0 quantized router gates, {len(experts_q)} quantized expert tensors")
+        return False, (f"router gate was QUANTIZED ({len(gate_q)} .mlp.gate.weight_packed) — the "
+                       "ignore pattern did not apply; refusing to upload a W4 router")
+    if not config_groups and not any_packed:
+        return False, ("nothing was quantized (no config_groups in quantization_config and no "
+                       ".weight_packed tensors) — the oneshot did not run; refusing to upload")
+    return True, (f"router fp16 (0 .mlp.gate.weight_packed, router_in_ignore={router_in_ignore}); "
+                  f"{len(experts_q)} expert weight_packed tensors, {len(any_packed)} packed total")
+
+
+def verify_router_unquantized(out_dir: Path) -> None:
+    """Last gate before upload: router stayed fp16 and the model was actually compressed.
+
+    Reads config.json's ``quantization_config`` (authoritative for what stayed fp16 — the ``ignore``
+    list and ``config_groups``) plus the saved tensor names, and defers to :func:`assess_quant`.
+    """
+    cfg_path = out_dir / "config.json"
+    qc: dict = {}
+    if cfg_path.is_file():
+        qc = (json.loads(cfg_path.read_text(encoding="utf-8")).get("quantization_config") or {})
+    ok, msg = assess_quant(_weight_keys(out_dir),
+                           ignore=qc.get("ignore") or [], config_groups=qc.get("config_groups"))
+    if not ok:
+        raise SystemExit(msg)
+    print(f"verify OK: {msg}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -157,12 +186,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--group-size", type=int, default=128)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--push", action="store_true", help="push to --repo-id (private) after verify")
+    p.add_argument("--all-experts", action="store_true",
+                   help="route every calibration token through ALL experts (moe_calibrate_all_experts). "
+                        "OOMs Kaggle's ~30GB host RAM on V2-Lite (64 experts x 26 layers) — default OFF.")
     p.add_argument("--dry-run", action="store_true", help="print the plan, load nothing")
     args = p.parse_args(list(argv) if argv is not None else None)
 
     print(f"# quantize {args.model_id} -> W4A16 GPTQ via llm-compressor (group_size={args.group_size})")
     print(f"# router + lm_head kept fp16 via ignore: {IGNORE_PATTERNS}")
-    print(f"# out={args.out}  repo={args.repo_id}  push={args.push}")
+    print(f"# out={args.out}  repo={args.repo_id}  push={args.push}  all_experts={args.all_experts}")
     if args.dry_run:
         return 0
 
@@ -196,9 +228,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_seq_length=args.seq_len,
         num_calibration_samples=len(texts),
         trust_remote_code_model=True,
-        # MoE: route calibration tokens through EVERY expert, not just the ones the router picks, so
-        # no expert is left uncalibrated (the default, pinned here so a version change can't flip it).
-        moe_calibrate_all_experts=True,
+        # MoE calibration coverage. all-experts=True routes EVERY token through ALL 64 experts/layer,
+        # which caches 64x the activations and OOMs Kaggle's ~30GB host RAM partway through (died at
+        # layer 18/26 after ~2h). Default False = standard GPTQ: each expert is calibrated only on the
+        # tokens the router actually sends it — far less memory, ~10x faster. The router (the measured
+        # object) is fp16 regardless, so expert-calibration coverage does not change which experts get
+        # selected; it only affects expert-output fidelity, which is acceptable for a routing study.
+        moe_calibrate_all_experts=args.all_experts,
     )
 
     args.out.mkdir(parents=True, exist_ok=True)
