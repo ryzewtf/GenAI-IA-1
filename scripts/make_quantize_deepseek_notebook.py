@@ -38,9 +38,10 @@ print("EXPECT two rows, compute_cap 7.5.")
 
 INSTALL_SRC = '''# Cell 2 — install llm-compressor + pin transformers. Do NOT restart the kernel after.
 # PIN RATIONALE (load-bearing):
-#  * llmcompressor==0.13.0 is a PURE-PYTHON wheel (no CUDA compile) — this is the whole reason we use
-#    it instead of GPTQModel, whose sdist kernels fail to build on the Kaggle py3.13 image. 0.13.0 is
-#    the newest release still pinning transformers>=4.56.1,<=4.57.6 (0.14.0 jumped to transformers 5).
+#  * llmcompressor==0.11.0 is a PURE-PYTHON wheel (no CUDA compile) — this is the whole reason we use
+#    it instead of GPTQModel, whose sdist kernels fail to build on the Kaggle py3.13 image. 0.11.0 is
+#    the NEWEST release still pinning transformers>=4.56.1,<=4.57.6 (verified on PyPI; 0.12.0.1 already
+#    jumped to transformers>=5.9). It pins compressed-tensors==0.16.0 and torch 2.10–2.11.
 #  * transformers==4.57.6 (inside that pin) is load-bearing twice over: transformers 5.0 REMOVED
 #    `is_torch_fx_available`, which DeepSeek-V2-Lite's trust_remote_code modeling imports, AND v5
 #    silently mis-tokenizes DeepSeek — which would corrupt calibration. 4.57.6 keeps both correct.
@@ -58,7 +59,7 @@ def sh(args):
 # Pure-python wheel: no --no-build-isolation, no compiler, no ninja. Pin transformers in the same
 # resolve so llmcompressor's own pin can't drag in a different one.
 rc = sh([sys.executable, "-m", "pip", "install", "-q",
-         "llmcompressor==0.13.0", "transformers==4.57.6"])
+         "llmcompressor==0.11.0", "transformers==4.57.6"])
 if rc != 0:
     raise SystemExit(
         "pip install FAILED (exit %d above) — read the tail for the cause (usually a transformers or "
