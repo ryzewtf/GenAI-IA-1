@@ -182,9 +182,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--repo-id", default="Ryze242005/DeepSeek-V2-Lite-w4a16-gptq")
     p.add_argument("--calib-corpus", type=Path, default=None,
                    help="JSONL with a 'text' field (the mounted mixed-v2 corpus); wikitext if omitted")
-    p.add_argument("--calib-samples", type=int, default=256)
+    p.add_argument("--calib-samples", type=int, default=128,
+                   help="calibration docs. 128 is a standard W4A16 size; fewer = smaller CPU-side "
+                        "activation cache and faster. Router stays fp16, so this only affects expert "
+                        "fidelity, not the measured routing.")
     p.add_argument("--group-size", type=int, default=128)
-    p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--seq-len", type=int, default=1024,
+                   help="calibration sequence length. Activation-cache RAM scales with samples*seq; "
+                        "1024 halves it vs 2048 with negligible W4A16 quality cost.")
+    # DeepSeek-V2-Lite is ~15.7B (~31GB bf16) — it does NOT fit in Kaggle's ~30GB host RAM alongside
+    # quantization overhead, which OOM-killed (exit -9) the fully-resident run at layer 18/26. These
+    # spill the model across BOTH T4s + a bounded CPU slice + disk, so host RAM can never fill. The GPU
+    # caps are resident-weight budgets only (leaving headroom for the sequential pipeline's per-layer
+    # onload + Hessian scratch); runtime allocations may exceed them up to the 15GB physical limit.
+    p.add_argument("--offload-dir", type=Path, default=Path("/kaggle/working/offload"),
+                   help="disk folder for weights that don't fit in the GPU+CPU budget (Kaggle disk).")
+    p.add_argument("--max-gpu-mem", default="11GiB",
+                   help="per-GPU resident-weight cap (T4=15GB usable; the rest is onload/Hessian room).")
+    p.add_argument("--max-cpu-mem", default="8GiB",
+                   help="host-RAM cap for resident weights — kept well under Kaggle's ~29GB so the "
+                        "CPU-side activation cache + Python can't OOM.")
+    p.add_argument("--no-offload", action="store_true",
+                   help="load fully resident (torch_dtype=auto, no device_map) — only for a box whose "
+                        "RAM comfortably exceeds the model; OOMs on Kaggle.")
     p.add_argument("--push", action="store_true", help="push to --repo-id (private) after verify")
     p.add_argument("--all-experts", action="store_true",
                    help="route every calibration token through ALL experts (moe_calibrate_all_experts). "
@@ -195,6 +215,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"# quantize {args.model_id} -> W4A16 GPTQ via llm-compressor (group_size={args.group_size})")
     print(f"# router + lm_head kept fp16 via ignore: {IGNORE_PATTERNS}")
     print(f"# out={args.out}  repo={args.repo_id}  push={args.push}  all_experts={args.all_experts}")
+    print(f"# calib: {args.calib_samples} samples x {args.seq_len} tok  "
+          f"| load={'resident' if args.no_offload else 'offload(2xGPU+CPU+disk)'}")
     if args.dry_run:
         return 0
 
@@ -208,8 +230,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     from llmcompressor.modifiers.quantization import GPTQModifier  # noqa: PLC0415
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype="auto", trust_remote_code=True)
+    if args.no_offload:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id, torch_dtype="auto", trust_remote_code=True)
+    else:
+        # Spill the ~31GB model across both T4s + a bounded CPU slice + disk. accelerate's device_map
+        # places layers to fit this budget; the llm-compressor sequential pipeline then onloads the
+        # active layer to the GPU for compute (align_module_device is accelerate-hook-aware), so a
+        # dispatched/offloaded model is supported. CPU is capped low so host RAM cannot OOM.
+        import torch  # noqa: PLC0415
+
+        args.offload_dir.mkdir(parents=True, exist_ok=True)
+        n_gpu = torch.cuda.device_count()
+        max_memory = {i: args.max_gpu_mem for i in range(n_gpu)}
+        max_memory["cpu"] = args.max_cpu_mem
+        print(f"# offload load: device_map=auto  max_memory={max_memory}  disk={args.offload_dir}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id, torch_dtype="auto", trust_remote_code=True,
+            device_map="auto", max_memory=max_memory,
+            offload_folder=str(args.offload_dir), offload_state_dict=True)
+        dev_map = getattr(model, "hf_device_map", None)
+        if dev_map:
+            where = {str(v) for v in dev_map.values()}
+            print(f"# dispatched across: {sorted(where)} ({len(dev_map)} modules)")
 
     ds = Dataset.from_dict({"text": texts})
     # The "W4A16" scheme preset already fixes 4-bit group-128 weight quant — GPTQModifier rejects a

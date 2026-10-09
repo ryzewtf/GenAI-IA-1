@@ -157,8 +157,10 @@ argv = [
     "--out", "/tmp/deepseek-w4a16",
     "--repo-id", "{REPO_ID}",
     "--calib-corpus", str(CORPUS),
-    "--calib-samples", "256",
+    "--calib-samples", "128",   # lighter calibration (was 256); --seq-len defaults to 1024 now
     "--push",
+    # The 15.7B model is loaded with disk+2xGPU+CPU offload by default (see quantize_deepseek.py);
+    # that is what keeps it inside Kaggle's ~30GB host RAM. Do NOT add --no-offload here.
 ]
 print("$", " ".join(argv), flush=True)
 rc = subprocess.run(argv, text=True).returncode
