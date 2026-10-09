@@ -15,13 +15,16 @@ import json
 from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[1] / "notebooks" / "quantize_deepseek.ipynb"
-REPO_ID = "Ryze242005/DeepSeek-V2-Lite-w4a16-gptq"
+REPO_ID = "Ryze242005/DeepSeek-V2-Lite-w8a8-int8"
 
-HEADER_MD = f"""# DeepSeek-V2-Lite -> W4A16 (GPTQ via llm-compressor, router fp16) — one-time quantization
+HEADER_MD = f"""# DeepSeek-V2-Lite -> W8A8-INT8 (GPTQ via llm-compressor, router fp16) — one-time quantization
 
-Self-quantizes the routed experts to 4-bit and keeps the router (+lm_head) in fp16, then pushes to
+Self-quantizes the experts to **INT8 (W8A8)** and keeps the router (+lm_head) in fp16, then pushes to
 `{REPO_ID}` (private, compressed-tensors). Uses **llm-compressor**, not GPTQModel (whose CUDA kernels
-fail to compile on the Kaggle py3.13 image). See scripts/quantize_deepseek.py and configs/models.yaml.
+fail to compile on the Kaggle py3.13 image). **Scheme is W8A8, NOT W4A16**: vLLM runs compressed-tensors
+int4/W8A16 only via the Marlin kernel (compute capability 80 / Ampere), which HARD-FAILS on the T4
+(sm_75) the campaign uses; INT8 W8A8 uses the cutlass int8 + Triton int8-MoE paths, which run on Turing.
+int8 ≈ 16 GB → TP=2 across the two T4s. See scripts/quantize_deepseek.py and configs/models.yaml.
 
 **Before running:** GPU **T4 x2**, **Internet On**, **Add Input -> the mixed-v2 corpus dataset**
 (calibration), and Kaggle **Secrets**: `HF_TOKEN` (write) + `GITHUB_TOKEN`. One-time; paste back the

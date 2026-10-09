@@ -103,3 +103,26 @@ def test_assess_quant_does_not_false_fail_on_surprising_expert_key_names():
     surprising = ["model.layers.1.mlp.gate.weight", "some.other.module.weight_packed"]
     ok, msg = assess_quant(surprising, ignore=_IGNORE, config_groups=_CFG_GROUPS)
     assert ok, msg
+
+
+# ---- W8A8 int8 (Turing-viable scheme): experts store weight_scale, NOT weight_packed ----
+
+_W8A8_KEYS = [
+    "model.layers.1.mlp.gate.weight",                      # router: plain fp16 weight
+    "model.layers.1.mlp.experts.0.down_proj.weight",       # int8 weight (not packed)
+    "model.layers.1.mlp.experts.0.down_proj.weight_scale",
+    "model.layers.1.mlp.shared_experts.up_proj.weight_scale",
+    "lm_head.weight",
+]
+
+
+def test_assess_quant_accepts_w8a8_int8_experts_via_weight_scale():
+    ok, msg = assess_quant(_W8A8_KEYS, ignore=_IGNORE, config_groups={"group_0": {"weights": {"num_bits": 8}}})
+    assert ok, msg
+    assert "quantized expert" in msg.lower()
+
+
+def test_assess_quant_hard_fails_on_w8a8_quantized_router():
+    bad = _W8A8_KEYS + ["model.layers.1.mlp.gate.weight_scale"]  # router int8 — must never ship
+    ok, msg = assess_quant(bad, ignore=_IGNORE, config_groups={"group_0": {"weights": {"num_bits": 8}}})
+    assert not ok and "router" in msg.lower()

@@ -131,31 +131,35 @@ def _weight_keys(out_dir: Path) -> list[str]:
 def assess_quant(keys: list[str], *, ignore: list, config_groups: dict | None) -> tuple[bool, str]:
     """Pure verdict on a saved compressed-tensors checkpoint. Returns (ok, message).
 
+    Scheme-agnostic: a quantized Linear is marked by ``.weight_packed`` (W4A16 pack-quantized, sub-byte)
+    OR ``.weight_scale`` (W8A8 int8, stored as int8 ``.weight`` + a scale) — we key on BOTH so a W8A8
+    checkpoint (int8, Turing-viable) verifies as well as a W4A16 one.
+
     HARD FAIL only on genuine defects, so a surprising-but-fine checkpoint is never rejected (that
-    would waste a ~30-min run):
-      * router QUANTIZED — any ``.mlp.gate.weight_packed`` tensor. This is the one thing we must never
-        ship, so its mere presence fails.
-      * nothing compressed — no ``config_groups`` in quantization_config AND no ``.weight_packed``
-        tensor anywhere: the oneshot did not quantize, so there is nothing to upload.
-    Everything else (expert count, exact key spelling) is reported but does not fail: pack-quantized
-    W4A16 stores 4-bit payloads as ``<module>.weight_packed`` and config.json lists kept-fp16 modules
-    under ``ignore`` (our router/lm_head/dense-layer-0 patterns), which we surface for the human.
+    would waste a multi-hour run):
+      * router QUANTIZED — any ``.mlp.gate.weight_packed`` OR ``.mlp.gate.weight_scale`` tensor. This
+        is the one thing we must never ship, so its mere presence fails.
+      * nothing compressed — no ``config_groups`` in quantization_config AND no ``.weight_packed`` /
+        ``.weight_scale`` tensor anywhere: the oneshot did not quantize, so there is nothing to upload.
+    Everything else (expert count, exact key spelling) is reported but does not fail.
     """
-    gate_q = [k for k in keys if re.search(r"\.mlp\.gate\.weight_packed$", k)]
-    experts_q = [k for k in keys if ".mlp.experts" in k and k.endswith(".weight_packed")]
-    any_packed = [k for k in keys if k.endswith(".weight_packed")]
+    gate_q = [k for k in keys
+              if re.search(r"\.mlp\.gate\.weight_packed$", k) or re.search(r"\.mlp\.gate\.weight_scale$", k)]
+    experts_q = [k for k in keys
+                 if ".mlp.experts" in k and (k.endswith(".weight_packed") or k.endswith(".weight_scale"))]
+    any_q = [k for k in keys if k.endswith(".weight_packed") or k.endswith(".weight_scale")]
     router_in_ignore = any(
         "mlp.gate" in str(e) and "gate_proj" not in str(e) and "gate_up" not in str(e)
         for e in (ignore or [])
     )
     if gate_q:
-        return False, (f"router gate was QUANTIZED ({len(gate_q)} .mlp.gate.weight_packed) — the "
-                       "ignore pattern did not apply; refusing to upload a W4 router")
-    if not config_groups and not any_packed:
+        return False, (f"router gate was QUANTIZED ({len(gate_q)} .mlp.gate.weight_packed/_scale) — the "
+                       "ignore pattern did not apply; refusing to upload a quantized router")
+    if not config_groups and not any_q:
         return False, ("nothing was quantized (no config_groups in quantization_config and no "
-                       ".weight_packed tensors) — the oneshot did not run; refusing to upload")
-    return True, (f"router fp16 (0 .mlp.gate.weight_packed, router_in_ignore={router_in_ignore}); "
-                  f"{len(experts_q)} expert weight_packed tensors, {len(any_packed)} packed total")
+                       ".weight_packed/.weight_scale tensors) — the oneshot did not run; refusing to upload")
+    return True, (f"router fp16 (0 quantized .mlp.gate, router_in_ignore={router_in_ignore}); "
+                  f"{len(experts_q)} quantized expert tensors, {len(any_q)} quantized total")
 
 
 def verify_router_unquantized(out_dir: Path) -> None:
@@ -179,14 +183,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Self-quantize DeepSeek-V2-Lite to W4A16 (router fp16)")
     p.add_argument("--model-id", default="deepseek-ai/DeepSeek-V2-Lite")
     p.add_argument("--out", type=Path, required=True, help="local output dir for the quantized model")
-    p.add_argument("--repo-id", default="Ryze242005/DeepSeek-V2-Lite-w4a16-gptq")
+    p.add_argument("--repo-id", default="Ryze242005/DeepSeek-V2-Lite-w8a8-int8")
+    # SCHEME MUST be a Turing-viable one. vLLM runs compressed-tensors WNA16 (W4A16 / W8A16) ONLY via
+    # the Marlin kernel, which requires compute capability 80 (Ampere) — it HARD-FAILS on the T4 (sm_75)
+    # the campaign runs on ("Min capability: 80. Current capability: 75", on a dense attn Linear, during
+    # load). INT8 W8A8 uses the cutlass int8 GEMM (dense, min_capability=75) + the Triton fused_experts
+    # int8 MoE path (no capability guard) — both run on Turing. So default is W8A8, NOT W4A16/W8A16.
+    # Router + lm_head stay fp16 via ignore regardless of scheme (the measured object is untouched).
+    p.add_argument("--scheme", default="W8A8", choices=["W8A8", "W4A16"],
+                   help="W8A8 (int8 w+a, Turing-viable, DEFAULT) or W4A16 (int4, Marlin/sm_80-only — "
+                        "DEAD on T4, kept only for Ampere+ boxes).")
     p.add_argument("--calib-corpus", type=Path, default=None,
                    help="JSONL with a 'text' field (the mounted mixed-v2 corpus); wikitext if omitted")
     p.add_argument("--calib-samples", type=int, default=128,
-                   help="calibration docs. 128 is a standard W4A16 size; fewer = smaller CPU-side "
+                   help="calibration docs. 128 is a standard GPTQ size; fewer = smaller CPU-side "
                         "activation cache and faster. Router stays fp16, so this only affects expert "
                         "fidelity, not the measured routing.")
-    p.add_argument("--group-size", type=int, default=128)
+    p.add_argument("--group-size", type=int, default=128,
+                   help="only used by W4A16 (group-128). W8A8 int8 is per-channel; this is ignored.")
     p.add_argument("--seq-len", type=int, default=1024,
                    help="calibration sequence length. Activation-cache RAM scales with samples*seq; "
                         "1024 halves it vs 2048 with negligible W4A16 quality cost.")
@@ -212,7 +226,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="print the plan, load nothing")
     args = p.parse_args(list(argv) if argv is not None else None)
 
-    print(f"# quantize {args.model_id} -> W4A16 GPTQ via llm-compressor (group_size={args.group_size})")
+    print(f"# quantize {args.model_id} -> {args.scheme} GPTQ via llm-compressor"
+          f"{f' (group_size={args.group_size})' if args.scheme == 'W4A16' else ' (int8 per-channel)'}")
     print(f"# router + lm_head kept fp16 via ignore: {IGNORE_PATTERNS}")
     print(f"# out={args.out}  repo={args.repo_id}  push={args.push}  all_experts={args.all_experts}")
     print(f"# calib: {args.calib_samples} samples x {args.seq_len} tok  "
@@ -255,13 +270,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"# dispatched across: {sorted(where)} ({len(dev_map)} modules)")
 
     ds = Dataset.from_dict({"text": texts})
-    # The "W4A16" scheme preset already fixes 4-bit group-128 weight quant — GPTQModifier rejects a
-    # separate group_size kwarg (pydantic extra_forbidden). 128 is exactly what we want; to use a
-    # different group size you would pass a full config_groups=QuantizationScheme(...) instead.
-    if args.group_size != 128:
+    # Scheme presets fix their own layout, and GPTQModifier rejects a separate group_size kwarg
+    # (pydantic extra_forbidden). W4A16 = int4 group-128 (hence the 128 guard + the dense-layer-0
+    # ignore, since 10944 isn't divisible by 128). W8A8 = int8 per-channel weights + dynamic int8
+    # activations — no group size, so the divisibility issue does not arise. Router + lm_head stay fp16
+    # via IGNORE_PATTERNS either way.
+    if args.scheme == "W4A16" and args.group_size != 128:
         raise SystemExit(f"--group-size {args.group_size}: the W4A16 scheme is fixed at group_size=128; "
                          "pass config_groups in the recipe to change it.")
-    recipe = GPTQModifier(targets="Linear", scheme="W4A16", ignore=IGNORE_PATTERNS)
+    recipe = GPTQModifier(targets="Linear", scheme=args.scheme, ignore=IGNORE_PATTERNS)
 
     oneshot(
         model=model,
