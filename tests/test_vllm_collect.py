@@ -320,6 +320,40 @@ def test_build_vllm_manifest_has_engine_neutral_keys(tmp_path):
         assert got.get(key) is not None, key
 
 
+def test_build_vllm_manifest_records_engine_env_in_device_plan(tmp_path):
+    """A per-model engine env (deepseek's VLLM_MLA_DISABLE=1) is a real engine difference and must be
+    in the provenance — it comes from the capture stats the engine recorded, not from the card."""
+    config = RunConfig.load(RUN_VLLM)
+    docs = [(0, "a b c d")]
+    plan = _plan(tmp_path / "s.jsonl", docs, hidden_stride=0)
+    shard_dir = tmp_path / "shard_00000"
+    shard_dir.mkdir()
+    stats = {"n_docs": 1, "n_tokens": 4, "n_captured": 0, "tensor_parallel_size": 2,
+             "engine_env": {"VLLM_MLA_DISABLE": "1"}}
+    manifest = build_vllm_manifest(
+        shard_dir, plan, stats, config=config, spec=SPEC, model="deepseek-v2-lite",
+        corpus="unit", model_meta=MODEL_META, n_ctx=2048,
+    )
+    assert manifest["device_plan"]["engine_env"] == {"VLLM_MLA_DISABLE": "1"}
+
+
+def test_capture_engine_stores_engine_env_without_loading():
+    """The constructor is torch-free; it must stringify and keep the env so load() can apply it before
+    LLM(). (The GPU load itself is proven by the P3/campaign notebook, not here.)"""
+    from src.capture.vllm_collect import VLLMCaptureEngine
+
+    eng = VLLMCaptureEngine(
+        model_id="x", tensor_parallel_size=2, spec=SPEC, gating=GATING,
+        max_model_len=2048, gpu_memory_utilization=0.9,
+        engine_env={"VLLM_MLA_DISABLE": 1},  # non-str value must be coerced
+    )
+    assert eng.engine_env == {"VLLM_MLA_DISABLE": "1"}
+    assert VLLMCaptureEngine(
+        model_id="x", tensor_parallel_size=1, spec=SPEC, gating=GATING,
+        max_model_len=2048, gpu_memory_utilization=0.9,
+    ).engine_env == {}
+
+
 # -- the full loop, through the real ledger + LocalDirBackend round-trip -----------------------
 
 

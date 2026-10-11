@@ -302,14 +302,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokenizer.save_pretrained(str(args.out))
     print(f"saved compressed-tensors model to {args.out}")
 
-    # compressed-tensors 0.16 writes scale_dtype/zp_dtype (null) into config.json, which the PINNED
-    # vLLM 0.10.2 rejects at engine-config parse (llm-compressor#2057). Strip them before push so the
-    # checkpoint loads on the campaign engine; lossless (both are null). See scripts/patch_quant_config.
+    # The producer (llmcompressor 0.11.0 -> compressed-tensors 0.16) writes config.json fields the
+    # PINNED consumer (vLLM 0.10.2 -> compressed-tensors 0.11.0) rejects: null scale_dtype/zp_dtype AND
+    # an illegal actorder on per-channel W8A8 args. Strip them at save so the checkpoint is born loadable
+    # on the campaign engine; all lossless (see scripts/patch_quant_config). patch_local reads this dir's
+    # safetensors index for the g_idx orphan-guard and validates against the installed ct if importable.
     from scripts.patch_quant_config import patch_local  # noqa: PLC0415
 
     stripped = patch_local(args.out / "config.json")
     if stripped:
-        print(f"stripped vLLM-incompatible quant keys from config.json: {stripped}")
+        print(f"stripped vLLM-incompatible quant-config keys from config.json: {stripped}")
 
     verify_router_unquantized(args.out)
 

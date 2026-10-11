@@ -166,6 +166,7 @@ class VLLMCaptureEngine:
         gpu_memory_utilization: float,
         dtype: str = "float16",
         seed: int = 0,
+        engine_env: Mapping[str, Any] | None = None,
     ) -> None:
         if gating.has_router_bias:
             # Defensive: a GatingOp built via gating_from_config always has has_router_bias=False,
@@ -188,6 +189,14 @@ class VLLMCaptureEngine:
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.dtype = dtype
         self.seed = int(seed)
+        # Per-model engine env (models.yaml vllm.env), applied to os.environ BEFORE LLM() so the config
+        # build and the TP workers (which inherit the environment) see it. DeepSeek-V2-Lite sets
+        # VLLM_MLA_DISABLE=1: vLLM's MLA PREFILL on CUDA hardcodes flash_attn_varlen_func (the Triton
+        # prefill branch is ROCm-only), and FA2 requires sm_80 — so MLA dies in the LLM() profile prefill
+        # on the T4 (sm_75). Disabling MLA selects the standard DeepseekV2Attention path (head_size 192,
+        # supported on Turing), which is algebraically the same into the MoE router — the measured object
+        # is unchanged; only the attention/KV implementation differs. Recorded in stats + the manifest.
+        self.engine_env = {str(k): str(v) for k, v in (engine_env or {}).items()}
 
         self.llm: Any = None
         self.tokenizer: Any = None
@@ -202,6 +211,11 @@ class VLLMCaptureEngine:
         os.environ["VLLM_USE_V1"] = "0"
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # Per-model overrides win over the defaults above (e.g. deepseek's VLLM_MLA_DISABLE=1). Set
+        # before importing/constructing vLLM so model-config build and spawned TP workers both see it.
+        for _k, _v in self.engine_env.items():
+            os.environ[_k] = _v
+            print(f"# engine env: {_k}={_v}", flush=True)
 
         from vllm import LLM, SamplingParams  # noqa: PLC0415 - GPU-only, lazy on purpose
 
@@ -423,6 +437,7 @@ def collect_shard(
         "engine": "vllm",
         "vllm_version": getattr(engine, "vllm_version", None),
         "tensor_parallel_size": int(getattr(engine, "tensor_parallel_size", 1)),
+        "engine_env": dict(getattr(engine, "engine_env", {}) or {}),
         "shard_id": int(plan.shard_id),
         "n_docs": len(docs) - n_docs_truncated,
         "n_docs_in_shard": len(docs),
@@ -568,6 +583,9 @@ def build_vllm_manifest(
             "tensor_parallel": tp,
             "n_gpu": tp,
             "gpu_arch": config.gpu_arch,
+            # per-model engine env (e.g. deepseek's VLLM_MLA_DISABLE=1) — a real engine difference that
+            # belongs in the provenance, read back from the capture stats the engine recorded.
+            "engine_env": dict(stats.get("engine_env") or {}),
         },
         "collected_utc": _utc_now(),
         "kaggle_session_id": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "local"),
@@ -849,6 +867,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         dtype=str(config.build.get("dtype", "float16")),
         seed=int(config.inference.get("seed", 0)),
+        engine_env=vllm.get("env") or {},
     )
     engine.vllm_version = config.build.get("vllm_version")
     engine.load()

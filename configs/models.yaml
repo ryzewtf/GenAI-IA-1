@@ -267,7 +267,13 @@ models:
     # already drives layer_index_map. Shared experts (.mlp.shared_experts) are NOT matched by the
     # suffixes and stay quantized like routed experts (only the router gate is fp16). model_sha256
     # null until the self-quant repo exists → collector resolves + pin.
-    vllm: {model_id: Ryze242005/DeepSeek-V2-Lite-w8a8-int8, quant: compressed-tensors-w8a8, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null}
+    # env.VLLM_MLA_DISABLE=1: DeepSeek-V2 is the campaign's only MLA model, and vLLM 0.10.2's MLA PREFILL
+    # on CUDA hardcodes flash_attn_varlen_func (the Triton prefill branch is ROCm-only); FA2 needs sm_80,
+    # so MLA dies in the LLM() profile prefill on the T4 (sm_75). Disabling MLA selects standard
+    # DeepseekV2Attention (head_size 192, Turing-supported), algebraically identical into the MoE router
+    # (the measured object is untouched; only the attention/KV impl differs). vllm_collect applies it to
+    # os.environ before LLM(); it is recorded in capture_stats + manifest device_plan.engine_env.
+    vllm: {model_id: Ryze242005/DeepSeek-V2-Lite-w8a8-int8, quant: compressed-tensors-w8a8, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null, env: {VLLM_MLA_DISABLE: "1"}}
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
