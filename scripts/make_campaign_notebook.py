@@ -204,6 +204,12 @@ import subprocess, sys
 import yaml as _yaml
 _meta = _yaml.safe_load(open("configs/models.yaml", encoding="utf-8"))["models"][MODEL_KEY]
 _vllm = _meta.get("vllm") or {{}}
+if not _vllm.get("model_id"):
+    raise SystemExit(
+        f"{{MODEL_KEY}} has no vllm block in models.yaml — it is NOT collected on vLLM. "
+        "deepseek-v2-lite is a llama.cpp model (compressed-tensors MoE is dead on the T4/sm_75 in every "
+        "scheme): collect it via notebooks/moe_session.ipynb (STAGE='collect', MODEL='deepseek-v2-lite', "
+        "HF_REPO_ID=Ryze242005/llamacpp-traces-v2). Set MODEL_KEY to a vLLM-panel model here instead.")
 if str(_vllm.get("quant") or "").startswith("compressed-tensors"):
     _repo = _vllm["model_id"]
     print(f"# patching quant config on {{_repo}} for vLLM {VLLM_VERSION} (compressed-tensors 0.11.0)", flush=True)

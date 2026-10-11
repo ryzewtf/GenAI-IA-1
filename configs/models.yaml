@@ -251,29 +251,19 @@ models:
     # is dense, trace layer 0 is model layer 1), so a converter that renumbered blocks would show
     # up there first. That check is still worth running: it now tests our converter rather than
     # someone else's, which is the version of the question that matters.
-    # vLLM engine (Tier 2). No Turing-viable public INT4 exists (D2), so SELF-QUANTIZE via llm-compressor
-    # (GPTQ), keeping the router + lm_head fp16 (ignore=["lm_head", r"re:.*\.mlp\.gate$", dense-layer-0] —
-    # scripts/quantize_deepseek.py). NOTE engine is llm-compressor, NOT GPTQModel (whose CUDA kernels fail
-    # to compile on Kaggle's py3.13 image); it is a pure-python wheel pinning transformers 4.57.6.
-    # SCHEME = W8A8-INT8, NOT W4A16: vLLM runs compressed-tensors int4/W8A16 ONLY via the Marlin kernel
-    # (compute capability 80 / Ampere), which HARD-FAILS on the T4 (sm_75) — "Min capability: 80, Current:
-    # 75" at load, on a dense attn Linear. INT8 W8A8 uses cutlass int8 (dense, min_cap 75) + the Triton
-    # fused_experts int8 MoE path (no capability guard) → runs on Turing. (The earlier w4a16 repo loads
-    # ONLY on Ampere+.) int8 ≈ 16 GB → TP=2 across the two T4s; capture via the proven TP=2 worker path.
-    # Output is compressed-tensors (vLLM auto-detects; no --quantization flag) → repo
-    # Ryze242005/DeepSeek-V2-Lite-w8a8-int8.
-    # Layer-0 dense gap: first_k_dense_replace=1 → model layer 0 has no .mlp.gate/.mlp.experts, so
-    # discover_router_and_experts returns the 26 MoE modules (model layers 1..26); moe_layer_offset=1
-    # already drives layer_index_map. Shared experts (.mlp.shared_experts) are NOT matched by the
-    # suffixes and stay quantized like routed experts (only the router gate is fp16). model_sha256
-    # null until the self-quant repo exists → collector resolves + pin.
-    # env.VLLM_MLA_DISABLE=1: DeepSeek-V2 is the campaign's only MLA model, and vLLM 0.10.2's MLA PREFILL
-    # on CUDA hardcodes flash_attn_varlen_func (the Triton prefill branch is ROCm-only); FA2 needs sm_80,
-    # so MLA dies in the LLM() profile prefill on the T4 (sm_75). Disabling MLA selects standard
-    # DeepseekV2Attention (head_size 192, Turing-supported), algebraically identical into the MoE router
-    # (the measured object is untouched; only the attention/KV impl differs). vllm_collect applies it to
-    # os.environ before LLM(); it is recorded in capture_stats + manifest device_plan.engine_env.
-    vllm: {model_id: Ryze242005/DeepSeek-V2-Lite-w8a8-int8, quant: compressed-tensors-w8a8, tensor_parallel: 2, gpu_memory_utilization: 0.90, router_suffix: .mlp.gate, experts_suffix: .mlp.experts, model_sha256: null, env: {VLLM_MLA_DISABLE: "1"}}
+    # ENGINE = llama.cpp (joins gpt-oss + gemma-4 on the split-engine llama.cpp panel, D1), NOT vLLM.
+    # The vLLM path is DEAD on the T4 (sm_75) for this model in EVERY quantization we can produce, proven
+    # on paid sessions (2026-10-09..11): (1) W4A16 compressed-tensors → Marlin → min compute capability 80;
+    # (2) W8A8-INT8 compressed-tensors → the Triton fused_moe int8 `tl.dot` fails to COMPILE for cuda:75
+    # ("arith.extf operand must be floating-point-like, but got tensor<...xi8>"); (3) fp16 (~31 GB) does not
+    # fit 2×T4. The only Turing-viable vLLM MoE path is GPTQ-format int4 (MoeWNA16 dequantizes to an fp16
+    # dot — how qwen3-30b runs on T4), but GPTQModel won't build on Kaggle's py3.13 and hand-repacking a
+    # checkpoint is unsafe (SelectionMismatch can't catch corrupted expert weights). So there is NO vllm:
+    # block here — vllm_collect refuses deepseek by design ("has no vllm.model_id"). Collect on llama.cpp
+    # via moe_session.ipynb (STAGE=collect, MODEL=deepseek-v2-lite, HF_REPO_ID=Ryze242005/llamacpp-traces-v2)
+    # using the Q4_K_M GGUF above (run hash 4fb33286; F32 router; standard ffn_norm router_input, so the
+    # gemma4 router-input patch does NOT apply). The dead w8a8/w4a16 HF repos can be deleted later (D3).
+    # See memory/collection-campaign.md for the full kernel-by-kernel autopsy.
     router_dtype: F32
     node_names: {logits: ffn_moe_probs-%d, logits_biased: null, topk: ffn_moe_topk-%d, router_input: ffn_norm-%d}
     logit_tensor_used: ffn_moe_probs
