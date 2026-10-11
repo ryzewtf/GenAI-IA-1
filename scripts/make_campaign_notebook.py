@@ -186,11 +186,33 @@ COLLECT_SRC = f'''# ============================================================
 # ============================================================================
 # Tier-1 order: olmoe-0125 -> olmoe-0125-instruct -> olmoe-0924 -> qwen3-30b-a3b.
 # Tier-2 (same notebook, by MODEL_KEY): gpt-oss-20b (run notebooks/gptoss_probe FIRST — MXFP4-on-T4
-# is unproven) and deepseek-v2-lite (run notebooks/quantize_deepseek FIRST to build the W4A16 repo).
+# is unproven) and deepseek-v2-lite (run notebooks/quantize_deepseek FIRST to build the W8A8-INT8 repo;
+# this cell then auto-patches that repo's quant config below — no manual step).
 MODEL_KEY = "olmoe-0125"     # <<< set this per session
 TRACE_REPO = "{TRACE_REPO}"  # new repo; old llama.cpp traces untouched (D3)
 
 import subprocess, sys
+
+# --- Quant-config consumer-compat patch (self-quantized compressed-tensors models only) ------
+# A compressed-tensors repo we self-quantized is WRITTEN by compressed-tensors 0.16 (llmcompressor)
+# but READ by the PINNED vLLM {VLLM_VERSION}, which ships compressed-tensors 0.11.0 and REJECTS fields/
+# values 0.16 stamped in config.json: null scale_dtype/zp_dtype, and an illegal per-channel `actorder`.
+# scripts.patch_quant_config strips them IN PLACE on HF — lossless, idempotent, NO re-quant. It runs
+# HERE (not in the quant notebook) so it executes in THIS session, where ct 0.11.0 is installed (Cell 2)
+# and HF_TOKEN is loaded (Cell 4) — so its consumer-validate checks the REAL pin and prints the cleaned
+# weights/input_activations args. No-op (skipped) for fp16 / GPTQ models.
+import yaml as _yaml
+_meta = _yaml.safe_load(open("configs/models.yaml", encoding="utf-8"))["models"][MODEL_KEY]
+_vllm = _meta.get("vllm") or {{}}
+if str(_vllm.get("quant") or "").startswith("compressed-tensors"):
+    _repo = _vllm["model_id"]
+    print(f"# patching quant config on {{_repo}} for vLLM {VLLM_VERSION} (compressed-tensors 0.11.0)", flush=True)
+    _rc = subprocess.run(
+        [sys.executable, "-m", "scripts.patch_quant_config", "--repo-id", _repo], text=True).returncode
+    if _rc != 0:
+        raise SystemExit(f"patch_quant_config FAILED (exit {{_rc}}) — do NOT collect; fix the config first")
+else:
+    print(f"# {{MODEL_KEY}} is not a compressed-tensors model (quant={{_vllm.get('quant')!r}}); no config patch", flush=True)
 
 SCRATCH = "/tmp/vscratch"    # ledger + per-shard scratch (deleted after each verified upload)
 
