@@ -345,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="skip T1.2/T1.4; the collector will refuse to start without them")
     parser.add_argument("--rescan-nodes", action="store_true", help="redo T1.4 even if a spec exists")
     parser.add_argument("--cpu", action="store_true", help="build without CUDA (CPU-only session)")
+    parser.add_argument("--extra-targets", nargs="*", default=(),
+                        help="additional llama.cpp targets, e.g. llama-quantize for the T8.1 "
+                             "ladder's Q8_0 rung in a CUDA session")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     # Set before anything imports huggingface_hub or spawns `hf`.
@@ -398,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             _say("\n== build (this is the slow one)")
             targets = _build_targets(cuda=ctx.cuda, skip_gates=args.skip_gates)
+            targets += tuple(t for t in args.extra_targets if t not in targets)
             result = step_build(ctx, targets=targets)
             _say(f"  -> {result.status}: {result.detail[:300]}")
             if result.failed:

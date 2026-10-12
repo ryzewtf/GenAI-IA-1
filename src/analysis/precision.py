@@ -229,9 +229,12 @@ class LadderComparison:
 # -- comparison ------------------------------------------------------------------------------
 
 
-def _check_comparable(reference: TraceReader, candidate: TraceReader) -> list[str]:
+def _check_comparable(
+    reference: TraceReader, candidate: TraceReader, *, cross_engine: bool = False
+) -> list[str]:
     ref_m, cand_m = reference.manifests[0], candidate.manifests[0]
-    mismatched = [k for k in COMPARABLE_KEYS if ref_m.get(k) != cand_m.get(k)]
+    keys = [k for k in COMPARABLE_KEYS if not (cross_engine and k == "llama_cpp_commit")]
+    mismatched = [k for k in keys if ref_m.get(k) != cand_m.get(k)]
     if mismatched:
         detail = ", ".join(f"{k}: {ref_m.get(k)!r} vs {cand_m.get(k)!r}" for k in mismatched)
         raise PrecisionError(
@@ -246,7 +249,17 @@ def _check_comparable(reference: TraceReader, candidate: TraceReader) -> list[st
 
     notes: list[str] = []
     ref_q, cand_q = str(ref_m.get("quant", "?")), str(cand_m.get("quant", "?"))
-    if ref_q == cand_q:
+    if cross_engine:
+        ref_e = ref_m.get("engine_build") or f"llama_cpp@{ref_m.get('llama_cpp_commit')}"
+        cand_e = cand_m.get("engine_build") or f"llama_cpp@{cand_m.get('llama_cpp_commit')}"
+        if ref_e == cand_e:
+            raise PrecisionError(f"--cross-engine but both traces come from {ref_e}")
+        notes.append(
+            f"ENGINE COMPARISON {ref_e} ({ref_q}) vs {cand_e} ({cand_q}): measures engine + "
+            "precision together, not quantization alone. Read it as the bound on how far the "
+            "split-engine panel's pairs can differ for engine reasons."
+        )
+    elif ref_q == cand_q:
         notes.append(
             f"BOTH SIDES ARE {ref_q}: this comparison measures run-to-run nondeterminism, not "
             "quantization drift. Useful as a floor, misleading as a ladder rung — label it."
@@ -290,14 +303,18 @@ def compare_traces(
     margin_quantiles: Sequence[float] = DEFAULT_MARGIN_QUANTILES,
     chunk_tokens: int = 50_000,
     max_tokens: int | None = None,
+    cross_engine: bool = False,
 ) -> LadderComparison:
     """Compare a candidate trace against a reference, per layer (plan T8.2).
+
+    ``cross_engine`` admits a llama.cpp-vs-vLLM pair (the engine-equivalence rung): the build
+    commit is then expected to differ and is reported as a note rather than refused.
 
     Accumulated in chunks so a 4M-token trace does not need a 4M x n_experts float array
     resident; the margin binning needs the margins for the whole layer at once, so those are
     accumulated as a float32 vector (4 bytes per token per layer, ~16 MB for OLMoE at 1M tokens).
     """
-    notes = _check_comparable(reference, candidate)
+    notes = _check_comparable(reference, candidate, cross_engine=cross_engine)
 
     n_tokens = reference.n_tokens if max_tokens is None else min(max_tokens, reference.n_tokens)
     if n_tokens <= 0:
@@ -607,12 +624,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="skip the check that the two legs differ in the knob under test. Only "
                              "for traces collected before capture_variant existed.")
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--cross-engine", action="store_true",
+                        help="compare a llama.cpp trace against a vLLM one (engine equivalence)")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
         reference = _open(args.reference_root, args.model, args.corpus)
         candidate = _open(args.candidate_root, args.candidate_model or args.model, args.corpus)
-        comparison = compare_traces(reference, candidate, max_tokens=args.max_tokens)
+        comparison = compare_traces(reference, candidate, max_tokens=args.max_tokens,
+                                    cross_engine=args.cross_engine)
     except (PrecisionError, FormatError, OSError) as exc:
         # A missing or malformed trace is "could not run" (exit 2), never "ran and found
         # drift" (exit 1). A caller scripting the ladder must be able to tell a rung that

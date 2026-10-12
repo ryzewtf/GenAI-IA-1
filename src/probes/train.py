@@ -114,7 +114,16 @@ def _make_predictor(feature: str, *, n_experts: int, vocab_size: int, layer: int
         # The one nonlinear probe (plan T7.5). Available on request, never a CPU-session default —
         # see CPU_FEATURES.
         return MLPProbe(n_experts=n_experts, feature=feature, layer=layer, seed=seed)
-    return SoftmaxProbe(n_experts=n_experts, feature=feature, layer=layer, seed=seed)
+    # Solver by feature. The dense router-input probes (F4, FV) condition on a 2048-2880-dim input
+    # that carries a lot of linearly-decodable signal; the minibatch AdamW path early-stops while
+    # the cosine LR is still large and quits far below the true linear ceiling (a closed-form OLS
+    # fit of the router input reaches set_agreement 1.0 on GPT-OSS where AdamW returned ~0.77).
+    # L-BFGS solves this convex objective to optimum and is fast on the ~60k-row hidden subsample.
+    # The sparse full-split count features (F2, F3, F6) already converge under AdamW — verified
+    # identical results with a 200-epoch budget — and full-batch L-BFGS over ~1.2M rows is far too
+    # slow for them, so they keep AdamW.
+    solver = "lbfgs" if feature in ("F4", "FV") else "adamw"
+    return SoftmaxProbe(n_experts=n_experts, feature=feature, layer=layer, seed=seed, solver=solver)
 
 
 def sweep(

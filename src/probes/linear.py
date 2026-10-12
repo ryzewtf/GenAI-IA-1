@@ -60,6 +60,16 @@ class SoftmaxProbe:
     seed: int = 0
     warmup_frac: float = 0.05
     verbose: bool = False
+    # Solver for this convex multinomial-logistic objective. "adamw" is the original minibatch
+    # path; "lbfgs" solves the (convex) problem to its global optimum with full-batch L-BFGS and a
+    # light L2 penalty. The minibatch path early-stops on val while the cosine LR is still large, so
+    # on high-signal dense inputs (F4/FV) it quits far below the true linear ceiling (a closed-form
+    # OLS fit of hidden->logits reaches set_agreement 1.0 on GPT-OSS where adamw returned ~0.77).
+    # L-BFGS removes that defect and the LR/patience knobs with it. F5's MLP is non-convex and keeps
+    # the adamw path.
+    solver: str = "adamw"
+    lbfgs_maxiter: int = 150
+    l2: float = 1e-4
 
     W: np.ndarray | None = field(default=None, init=False)
     b: np.ndarray | None = field(default=None, init=False)
@@ -86,6 +96,10 @@ class SoftmaxProbe:
             )
         n, self.top_k = int(sets.shape[0]), int(sets.shape[1])
         d = X_train.width
+
+        if self.solver == "lbfgs":
+            self._fit_lbfgs(X_train, sets, X_val, y_val, n=n, d=d)
+            return
 
         rng = np.random.default_rng(self.seed)
         # Zero init: for a convex softmax regression there is nothing to break symmetry between,
@@ -183,6 +197,81 @@ class SoftmaxProbe:
                 "batch_size": self.batch_size,
                 "max_epochs": self.max_epochs,
                 "patience": self.patience,
+                "seed": self.seed,
+                "dtype": "float32",
+            },
+            blocks=X_train.describe(),
+        )
+
+    def _fit_lbfgs(
+        self,
+        X_train: Design,
+        sets: np.ndarray,
+        X_val: Design | None,
+        y_val: np.ndarray | None,
+        *,
+        n: int,
+        d: int,
+    ) -> None:
+        """Full-batch L-BFGS on the convex per-slot cross-entropy with a light L2 penalty.
+
+        The gradient is the same ``softmax(z) - multi_hot(S)/k`` as the minibatch path; the loss
+        is accumulated over row-chunks so peak memory stays O(chunk x n_experts + d x n_experts),
+        never the full (n, n_experts) target matrix. Converging this convex objective removes the
+        early-stopping-under-high-LR defect of the adamw path.
+        """
+        from scipy.optimize import minimize
+
+        K = self.n_experts
+        T = soft_targets(sets, K)  # (n, K), each row sums to 1
+        # Densify the whole design ONCE and reuse it across L-BFGS evaluations: each eval is then a
+        # single BLAS matmul, not a Python loop that re-materialises the design every time. That is
+        # what makes the convex solve tractable for the full-corpus CPU features as well as the
+        # subsampled hidden probes.
+        Xd = X_train.densify(np.arange(n)).astype(np.float32)
+        inv = 1.0 / max(1, n)
+
+        def obj(theta: np.ndarray):
+            W = theta[: d * K].reshape(d, K).astype(np.float32)
+            b = theta[d * K :].astype(np.float32)
+            logq = log_softmax(Xd @ W + b)
+            loss = float(-(T * logq).sum()) * inv + 0.5 * self.l2 * float((W.astype(np.float64) ** 2).sum())
+            G = (np.exp(logq) - T)  # (n, K)
+            gW = (Xd.T @ G).astype(np.float64) * inv + self.l2 * W.astype(np.float64)
+            gb = G.sum(axis=0).astype(np.float64) * inv
+            return loss, np.concatenate([gW.ravel(), gb])
+
+        theta0 = np.zeros(d * K + K, dtype=np.float64)
+        res = minimize(
+            obj, theta0, method="L-BFGS-B", jac=True,
+            options={"maxiter": self.lbfgs_maxiter, "maxfun": self.lbfgs_maxiter * 2,
+                     "ftol": 1e-9, "gtol": 1e-6},
+        )
+        self.W = res.x[: d * K].reshape(d, K).astype(np.float32)
+        self.b = res.x[d * K :].astype(np.float32)
+
+        best_ce = float("nan")
+        if X_val is not None and y_val is not None and np.asarray(y_val).size:
+            best_ce = self.slot_ce(X_val, y_val)
+        self.report = FitReport(
+            feature=self.feature,
+            predictor=self.name,
+            layer=self.layer,
+            n_train_rows=n,
+            n_val_rows=int(np.asarray(y_val).shape[0]) if y_val is not None else 0,
+            top_k=self.top_k,
+            n_experts=self.n_experts,
+            design_width=int(d),
+            epochs_run=int(res.nit),
+            best_epoch=int(res.nit),
+            best_val_ce_bits=best_ce if math.isfinite(best_ce) else float("nan"),
+            val_ce_history=[],
+            hyperparams={
+                "optimizer": "lbfgs",
+                "l2": self.l2,
+                "maxiter": self.lbfgs_maxiter,
+                "converged": bool(res.success),
+                "n_iter": int(res.nit),
                 "seed": self.seed,
                 "dtype": "float32",
             },

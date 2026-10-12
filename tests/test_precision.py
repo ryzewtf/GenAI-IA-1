@@ -263,6 +263,25 @@ def test_a_different_token_count_is_refused(tmp_path):
         compare_traces(reference, TraceReader(other, "synth-moe", "synth-v1"))
 
 
+def test_a_cross_engine_pair_is_refused_unless_asked_for(tmp_path):
+    """llama.cpp vs vLLM differ in llama_cpp_commit by construction; the ladder refuses that, the
+    engine-equivalence rung admits it and labels the result as engine + precision."""
+    vllm = {"llama_cpp_commit": None, "engine_build": "vllm@0.10.2"}
+    reference, candidate = make_pair(tmp_path, ref_quant="fp16", cand_quant="F16",
+                                     ref_overrides=vllm)
+    with pytest.raises(PrecisionError, match="llama_cpp_commit"):
+        compare_traces(reference, candidate)
+    result = compare_traces(reference, candidate, cross_engine=True)
+    assert result.mean_set_agreement == 1.0
+    assert any("ENGINE COMPARISON vllm@0.10.2" in n for n in result.notes)
+
+
+def test_cross_engine_on_one_engine_is_refused(tmp_path):
+    reference, candidate = make_pair(tmp_path)
+    with pytest.raises(PrecisionError, match="both traces come from"):
+        compare_traces(reference, candidate, cross_engine=True)
+
+
 def test_comparing_a_quant_against_itself_is_labelled_not_refused(tmp_path):
     """Legitimate as a nondeterminism floor — it is how you learn what 'zero drift' looks like on
     this hardware. Dangerous as an unlabelled ladder rung, because it will look excellent."""

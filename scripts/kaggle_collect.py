@@ -139,7 +139,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--decode-prefix", type=int, default=512)
     parser.add_argument("--override-tensor", default=None,
                         help=r"T3.7 candidate leg, e.g. 'blk\.\d+\.ffn_gate_inp\.weight=CPU'")
+    parser.add_argument("--quant", default=None,
+                        help="T8.1 ladder rung quant of --gguf (F16, Q8_0, ...); requires --gguf")
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.quant and not args.gguf:
+        _say("--quant labels the file passed via --gguf; without --gguf it would mislabel the "
+             "models.yaml default GGUF.")
+        return 2
 
     config = RunConfig.load(RUN_CONFIG)
     unhashed = config.unhashed or {}
@@ -243,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         runner_argv += ["--local-root", str(args.local_root or (scratch / "traces"))]
     if args.override_tensor:
         runner_argv += ["--override-tensor", args.override_tensor]
+    if args.quant:
+        runner_argv += ["--quant", args.quant]
     if args.shards:
         runner_argv += ["--shards", args.shards]
     if args.timeout_s:

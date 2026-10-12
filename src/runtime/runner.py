@@ -1346,6 +1346,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--decode-prefix", type=int, default=512)
     parser.add_argument("--override-tensor", default=None,
                         help=r"T3.7 candidate leg, e.g. 'blk\.\d+\.ffn_gate_inp\.weight=CPU'")
+    parser.add_argument("--quant", default=None,
+                        help="T8.1 ladder rung: quant of --model-path (e.g. F16, Q8_0); also "
+                             "re-hashes the file so the manifest names the weights actually loaded")
     args = parser.parse_args(argv)
 
     try:
@@ -1365,6 +1368,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config = RunConfig.load(args.run_config)
     model_meta = load_model_meta(args.models, args.model)
+    if args.quant:
+        # T8.1 ladder rung: the GGUF is NOT the one models.yaml records, so the manifest's quant and
+        # weights hash must describe the file actually loaded -- inheriting the Q4_K_M entry would
+        # label an F16 trace as Q4_K_M and T8.2 would compare two traces it believes are identical.
+        gguf_meta = dict(model_meta.get("gguf") or {})
+        gguf_meta.update(file=args.model_path.name, sha256=sha256_file(args.model_path),
+                         quant=args.quant)
+        model_meta = {**model_meta, "gguf": gguf_meta, "quant": args.quant}
     corpus_name = args.corpus_name or args.corpus.stem
 
     scratch = args.scratch or Path((config.unhashed.get("paths") or {}).get("scratch", "."))
