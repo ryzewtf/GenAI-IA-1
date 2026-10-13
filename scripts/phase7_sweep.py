@@ -44,7 +44,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--probe-kwargs", default=None,
                     help="JSON dict forwarded to the probe (e.g. '{\"solver\":\"lbfgs\"}'). "
                          "Keys apply only to the probe classes that define them (validated).")
+    ap.add_argument("--doc-strata", default=None, metavar="CORPUS_JSONL",
+                    help="also report test metrics per domain and per lang (T9.4), read from this "
+                         "corpus file's doc_id/domain/lang fields")
     args = ap.parse_args(argv)
+
+    doc_strata = None
+    if args.doc_strata:
+        doc_strata = {"domain": {}, "lang": {}}
+        with open(args.doc_strata, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    d = json.loads(line)
+                    doc_strata["domain"][int(d["doc_id"])] = str(d["domain"])
+                    doc_strata["lang"][int(d["doc_id"])] = str(d["lang"])
 
     pkw = json.loads(args.probe_kwargs) if args.probe_kwargs else {}
 
@@ -79,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                     force=args.force,
                     seed=args.seed,
                     probe_kwargs=pkw,
+                    doc_strata=doc_strata,
                 )
         except Exception as exc:
             print(f"!! {model}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

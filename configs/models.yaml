@@ -439,14 +439,14 @@ pairs:
     members: [gpt-oss-20b, olmoe-0125]
     holds_fixed: [activated_density_12.5pct]
     not_matched: [post_training, quant_format, depth, attention, aux_loss_coef, expert_ffn_width,
-                  vocabulary, pytorch_xval_coverage]
+                  vocabulary, pytorch_xval_coverage, engine]   # llama.cpp vs vLLM; Phase 8 bound 0.9955
     framing: "matched density, with these differences documented"
     controls: [olmoe-0125-instruct]
   pair_t:
     members: [qwen3-30b-a3b, gemma-4-26b-a4b]
     holds_fixed: [n_routed_experts_128, top_k_8]
     not_matched: [gemma_parallel_dense_mlp, hidden_dim, expert_ffn_width, vocabulary, attention,
-                  checkpoint_status]
+                  checkpoint_status, engine]   # vLLM GPTQ-Int4 vs llama.cpp
     framing: "matched routed-expert count and top-k, across two independent training pipelines"
   pair_a:
     members: [olmoe-0924, olmoe-0125]

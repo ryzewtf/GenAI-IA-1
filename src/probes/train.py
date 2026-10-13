@@ -140,6 +140,7 @@ def sweep(
     n_frequency_buckets: int = 10,
     estimator: str = "miller_madow",
     probe_kwargs: Mapping[str, Any] | None = None,
+    doc_strata: Mapping[str, Mapping[int, str]] | None = None,
 ) -> SweepResult:
     """Fit and evaluate every (layer, feature) not already on disk."""
     unknown = [f for f in features if f not in FEATURES]
@@ -202,6 +203,7 @@ def sweep(
                     n_frequency_buckets=n_frequency_buckets,
                     f1=f1_cache,
                     probe_kwargs=probe_kwargs or {},
+                    doc_strata=doc_strata,
                 )
             except UndefinedFeature as exc:
                 record = {
@@ -242,6 +244,7 @@ def _fit_one(
     n_frequency_buckets: int,
     f1: CountTablePredictor | None,
     probe_kwargs: Mapping[str, Any],
+    doc_strata: Mapping[str, Mapping[int, str]] | None = None,
 ) -> tuple[dict[str, Any], CountTablePredictor | None]:
     """Fit one cell on train, early-stop on val, evaluate on test."""
     needs_f1 = feature == "F6"
@@ -307,6 +310,21 @@ def _fit_one(
         buckets=buckets,
         bucket_meta=bucket_meta,
     )
+
+    # Plan T9.4: per-document strata (domain, language) on the same fitted predictor and test rows.
+    # Per-stratum CE / Family A only (see evaluate_on_test); stored apart from F1's frequency strata.
+    if doc_strata:
+        test_docs = index.doc_ids[test.row_index]
+        metrics["doc_strata"] = {}
+        for name, mapping in doc_strata.items():
+            labels = sorted(set(mapping.values()))
+            code = {lab: i for i, lab in enumerate(labels)}
+            b = np.array([code[mapping[int(d)]] for d in test_docs], dtype=np.int64)
+            m = evaluate_on_test(
+                predictor, test.X, test.y, n_experts=reader.n_experts, top_k=reader.top_k,
+                estimator=estimator, buckets=b,
+            )
+            metrics["doc_strata"][name] = {labels[int(k)]: v for k, v in m["strata"].items()}
 
     report = getattr(predictor, "report", None)
     record: dict[str, Any] = {
