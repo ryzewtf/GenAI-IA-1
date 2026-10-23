@@ -363,6 +363,36 @@ def test_ratio_is_nan_for_a_deterministic_router():
     assert math.isnan(mi_lower_bound(0.0, 0.0, 64).ratio)
 
 
+def test_per_slot_ce_never_falls_below_log2_k():
+    # Audit L1: any q summing to 1 pays at least log2 k bits per slot, with equality only for
+    # q uniform on the executed set. This is what caps I_hat at H - log2 k.
+    rng = np.random.default_rng(3)
+    n, n_experts, k = 2000, 32, 4
+    true = np.stack([rng.choice(n_experts, size=k, replace=False) for _ in range(n)])
+    marginal = marginal_distribution(true, n_experts)
+    for alpha in (0.05, 1.0, 20.0):
+        pred = rng.dirichlet(np.full(n_experts, alpha), size=n)
+        assert per_slot_cross_entropy(pred, true, marginal) >= math.log2(k) - 1e-9
+    oracle = np.zeros((n, n_experts))
+    np.put_along_axis(oracle, true, 1.0 / k, axis=1)
+    assert per_slot_cross_entropy(oracle, true, marginal) == pytest.approx(math.log2(k), abs=1e-4)
+
+
+def test_ratio_attainable_divides_by_h_minus_log2_k():
+    result = mi_lower_bound(entropy_bits=5.0, cross_entropy_bits=4.0, n_experts=64, top_k=4)
+    assert result.attainable_bits == pytest.approx(3.0)
+    assert result.ratio_attainable == pytest.approx(1.0 / 3.0)
+    oracle = mi_lower_bound(entropy_bits=5.0, cross_entropy_bits=2.0, n_experts=64, top_k=4)
+    assert oracle.ratio_attainable == pytest.approx(1.0)
+    assert oracle.ratio == pytest.approx(0.6)  # the old ratio tops out at (H - log2 k) / H
+    payload = result.to_json()
+    assert payload["top_k"] == 4 and payload["ratio_attainable"] == pytest.approx(1.0 / 3.0)
+
+
+def test_ratio_attainable_is_nan_without_top_k():
+    assert math.isnan(mi_lower_bound(5.0, 4.0, 64).ratio_attainable)
+
+
 # --------------------------------------------------------------------------------------------
 # T6.4 — load-balance index
 # --------------------------------------------------------------------------------------------

@@ -401,6 +401,7 @@ METRICS: dict[str, tuple[str, str]] = {
     "ce_normalized": ("family_b", "ce_normalized"),
     "mi_bits": ("family_b", "mi_bits"),
     "mi_ratio": ("family_b", "ratio"),
+    "mi_attainable": ("family_b", "ratio_attainable"),
     "entropy_bits": ("family_b", "entropy_bits"),
     "cross_entropy_bits": ("family_b", "cross_entropy_bits"),
     "entropy_normalized": ("family_b", "entropy_normalized"),
@@ -410,7 +411,11 @@ METRICS: dict[str, tuple[str, str]] = {
     "recall@2k": ("family_a", "recall@{2k}"),
     "recall@4k": ("family_a", "recall@{4k}"),
 }
-"""Reportable metric names. ``mi_ratio`` is §1.2's ``Î/H``; it is signed, like ``mi_bits``."""
+"""Reportable metric names. ``mi_ratio`` is §1.2's ``Î/H``; it is signed, like ``mi_bits``.
+
+``mi_attainable`` is ``Î / (H − log2 k)``, the primary k-invariant Family B number (audit L1/L2;
+see :mod:`src.metrics.information`). Result files written before it existed lack the key, so it is
+derived from ``mi_bits``, ``entropy_bits`` and the model's ``top_k`` when absent."""
 
 LAYER_REDUCTIONS: tuple[str, ...] = ("per_layer", "mean", "per_normalized_depth")
 
@@ -421,6 +426,13 @@ def _metric_from_record(record: Mapping[str, Any], metric: str, top_k: int) -> A
     family, template = METRICS[metric]
     key = template.format(**{"k": top_k, "2k": 2 * top_k, "4k": 4 * top_k})
     payload = (record.get("metrics") or {}).get(family)
+    if metric == "mi_attainable" and payload and key not in payload:
+        if payload.get("mi_bits") is None or payload.get("entropy_bits") is None:
+            return MissingCell("metric_absent", "mi_bits/entropy_bits not present in this cell")
+        ceiling = float(payload["entropy_bits"]) - math.log2(top_k)
+        if not ceiling > 0.0:
+            return MissingCell("metric_absent", "attainable ceiling H - log2 k is not positive")
+        return float(payload["mi_bits"]) / ceiling
     if not payload or key not in payload:
         return MissingCell("metric_absent", f"{family}.{key} not present in this cell")
     value = payload[key]

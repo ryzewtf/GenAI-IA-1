@@ -20,6 +20,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,59 @@ def sh(*cmd: str) -> str:
         return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
     except Exception as exc:  # recorded, never fatal: a bundle with a gap beats no bundle
         return f"UNAVAILABLE ({type(exc).__name__})"
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def analysis_distributions(code_dirs: tuple[str, ...] = ("src", "scripts", "tests")) -> set[str]:
+    """Distributions the analysis code imports, plus everything they require, transitively.
+
+    A plain ``pip freeze`` also pins whatever else lives in the venv. Here that was editor tooling
+    (an editable markitdown checkout whose freeze line is not installable, and a dependency of it
+    that PyPI no longer serves), so ``pip install -r requirements.lock`` failed as a whole.
+    """
+    import ast
+    from importlib import metadata
+
+    top = set()
+    for d in code_dirs:
+        for path in Path(d).rglob("*.py"):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    top |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    top.add(node.module.split(".")[0])
+    by_module = metadata.packages_distributions()
+    todo = {_norm(dist) for mod in top for dist in by_module.get(mod, [])} | {"pytest"}
+    seen: set[str] = set()
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        try:
+            dist = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        seen.add(name)
+        for req in dist.requires or []:
+            if "extra ==" in req:
+                continue
+            todo.add(_norm(re.split(r"[\s;<>=!~\[(]", req, maxsplit=1)[0]))
+    return seen
+
+
+def frozen_requirements() -> str:
+    """``pip freeze`` of this interpreter, restricted to :func:`analysis_distributions`."""
+    keep = analysis_distributions()
+    text = sh(sys.executable, "-m", "pip", "freeze", "--exclude-editable")
+    return "\n".join(line for line in text.splitlines()
+                     if "==" in line and _norm(line.split("==")[0]) in keep)
 
 
 def sha256(path: Path) -> str:
@@ -108,8 +162,7 @@ def main(argv=None) -> int:
         f"dirty: {bool(status) and not status.startswith('UNAVAILABLE')}\n"
         + "".join(f"{e}: {b}\n" for e, b in sorted(engines.items())),
         encoding="utf-8")
-    (out / "requirements.lock").write_text(sh(sys.executable, "-m", "pip", "freeze") + "\n",
-                                           encoding="utf-8")
+    (out / "requirements.lock").write_text(frozen_requirements() + "\n", encoding="utf-8")
     (out / "kaggle_image.txt").write_text(
         "\n".join(sorted(images)) or "not recorded in manifests — see notebooks/*.ipynb kernel metadata",
         encoding="utf-8")

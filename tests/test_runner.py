@@ -527,6 +527,39 @@ def test_a_nodes_captured_count_that_is_not_three_streams_times_layers_fails_the
     assert result.status == "failed" and "nodes_captured" in result.error
 
 
+def test_decode_legs_bracket_nodes_captured_by_the_spans_actually_decoded(
+    plans, config, ledger, backend, spec_path, tmp_path
+):
+    """T3.8 legs decode one token per ubatch, so the prefill bracket would refuse a clean shard.
+
+    The 2026-10-23 GPU audit lost both decode legs this way: 76,075 tokens in 76,075 ubatches is
+    exactly right for ``full`` but outside the prefill bracket [166, 314].
+    """
+    per_ubatch = 3 * SPEC.n_moe_layers
+
+    def run(i, name, **stats):
+        return one_shard(plans[i], config=config, ledger=ledger, backend=backend,
+                         invoker=FakeInvoker(overrides=stats), spec_path=spec_path,
+                         tmp_path=tmp_path / name)
+
+    n_tokens = plans[0].n_docs * TOKENS_PER_DOC
+    result = run(0, "full", decode_mode="full", n_decode_steps=n_tokens,
+                 nodes_captured=per_ubatch * n_tokens)
+    assert result.status != "failed", result.error
+
+    # A full-decode stats file carrying the prefill count is still refused.
+    n_docs = plans[1].n_docs
+    result = run(1, "short", decode_mode="full", n_decode_steps=n_docs * TOKENS_PER_DOC,
+                 nodes_captured=per_ubatch * n_docs)
+    assert result.status == "failed" and "nodes_captured" in result.error
+
+    prefix = 3
+    steps = plans[2].n_docs * (1 + TOKENS_PER_DOC - prefix)
+    result = run(2, "tail", decode_mode="tail", decode_prefix=prefix, n_decode_steps=steps,
+                 nodes_captured=per_ubatch * steps)
+    assert result.status != "failed", result.error
+
+
 def test_a_hidden_row_count_that_the_global_stride_cannot_produce_fails_the_shard(
     plans, config, ledger, backend, spec_path, tmp_path
 ):

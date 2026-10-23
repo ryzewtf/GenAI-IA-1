@@ -16,6 +16,11 @@ but selected on test would get zero mass and CE would be infinite, and T5.3 coll
 histogram precisely because that case is expected. The leak this accepts is bounded and blunt —
 the test *label marginal*, at weight 1e-6, with no per-token test information reaching the
 predictor — and it is the plan's own construction rather than a choice made here.
+
+Every evaluation also reports ``family_b_uniform_mix``: the same bound with the mix target
+replaced by the uniform distribution, which is just as finite and uses no test information
+(audit L-k). The two differ only where a predictor gives the true expert almost no mass, so the
+gap between them measures how much the test-marginal mix can matter.
 """
 
 from __future__ import annotations
@@ -28,11 +33,12 @@ from ..metrics.information import (
     CrossEntropyAccumulator,
     DEFAULT_EPSILON,
     entropy,
+    epsilon_mix,
     expert_counts,
     marginal_distribution,
     mi_lower_bound,
 )
-from ..metrics.predictive import PredictiveAccumulator
+from ..metrics.predictive import PredictiveAccumulator, membership_mask, top_m_indices
 from .base import Predictor
 
 __all__ = ["evaluate_on_test", "TEST_SPLIT"]
@@ -65,6 +71,7 @@ def evaluate_on_test(
     chunk_rows: int = 65536,
     buckets: np.ndarray | None = None,
     bucket_meta: Mapping[str, Any] | None = None,
+    doc_ids: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Both metric families for one fitted predictor on the test split.
 
@@ -73,6 +80,12 @@ def evaluate_on_test(
     deliberately *not*, because it would need a per-stratum ``H`` and entropy estimated on a few
     thousand slots over 128 experts is badly enough biased that the resulting number would be
     dominated by stratum size rather than by predictability.
+
+    ``doc_ids`` (one per test row) additionally returns ``out["doc_aggregates"]``: per-document
+    sums of slot CE, slots, rows, recall@m hits, exact matches and expert counts. Those are
+    sufficient statistics for a **document-level bootstrap** of every metric here, including H
+    (audit L7); see :mod:`src.metrics.bootstrap`. They are arrays, not JSON — callers store them
+    separately.
     """
     y = np.asarray(y_test)
     if y.ndim != 2 or not y.size:
@@ -88,6 +101,10 @@ def evaluate_on_test(
     cross_entropy = CrossEntropyAccumulator(
         n_experts=n_experts, marginal=marginal, epsilon=epsilon, split=TEST_SPLIT
     )
+    uniform_ce = CrossEntropyAccumulator(
+        n_experts=n_experts, marginal=np.full(n_experts, 1.0 / n_experts), epsilon=epsilon,
+        split=TEST_SPLIT,
+    )
 
     strata: dict[int, dict[str, Any]] = {}
     if buckets is not None:
@@ -102,12 +119,46 @@ def evaluate_on_test(
                 ),
             }
 
+    agg: dict[str, np.ndarray] | None = None
+    if doc_ids is not None:
+        doc_ids = np.asarray(doc_ids, dtype=np.int64).ravel()
+        if doc_ids.shape[0] != n:
+            raise ValueError(f"doc_ids has {doc_ids.shape[0]} rows but y_test has {n}")
+        docs, doc_index = np.unique(doc_ids, return_inverse=True)
+        n_docs = docs.size
+        recall_ms = predictive.recall_targets
+        agg = {
+            "doc_ids": docs,
+            "rows": np.bincount(doc_index, minlength=n_docs).astype(np.float64),
+            "ce_bits_sum": np.zeros(n_docs),
+            "exact_sum": np.zeros(n_docs),
+            "recall_m": np.asarray(recall_ms, dtype=np.int64),
+            "recall_hits_sum": np.zeros((len(recall_ms), n_docs)),
+            "expert_counts": np.zeros((n_docs, n_experts)),
+        }
+
     for lo in range(0, n, chunk_rows):
         rows = np.arange(lo, min(lo + chunk_rows, n))
         probs = _proba(predictor, X_test, rows)
         chunk_y = y[rows]
         predictive.update(probs, chunk_y)
         cross_entropy.update(probs, chunk_y)
+        uniform_ce.update(probs, chunk_y)
+        if agg is not None:
+            di = doc_index[rows]
+            mixed = epsilon_mix(np.asarray(probs, dtype=np.float64), marginal, epsilon)
+            picked = np.take_along_axis(mixed, chunk_y.astype(np.intp), axis=1)
+            agg["ce_bits_sum"] += np.bincount(di, weights=-np.log2(picked).sum(axis=1),
+                                              minlength=agg["rows"].size)
+            mask = membership_mask(chunk_y, n_experts)
+            for i, m in enumerate(agg["recall_m"]):
+                hits = np.take_along_axis(mask, top_m_indices(probs, int(m)), axis=1).sum(axis=1)
+                agg["recall_hits_sum"][i] += np.bincount(di, weights=hits / top_k,
+                                                         minlength=agg["rows"].size)
+                if int(m) == top_k:
+                    agg["exact_sum"] += np.bincount(di, weights=(hits == top_k).astype(float),
+                                                    minlength=agg["rows"].size)
+            np.add.at(agg["expert_counts"], (np.repeat(di, top_k), chunk_y.ravel()), 1.0)
         if buckets is not None:
             chunk_buckets = buckets[rows]
             for label, acc in strata.items():
@@ -124,6 +175,7 @@ def evaluate_on_test(
         estimator=estimator,
         entropy_split=TEST_SPLIT,
         ce_split=TEST_SPLIT,
+        top_k=top_k,
     )
 
     out: dict[str, Any] = {
@@ -132,9 +184,18 @@ def evaluate_on_test(
         "n_slots": int(y.size),
         "family_a": predictive.result(),
         "family_b": bound.to_json(),
+        "family_b_uniform_mix": mi_lower_bound(
+            entropy_bits, uniform_ce.result(), n_experts, estimator=estimator,
+            entropy_split=TEST_SPLIT, ce_split=TEST_SPLIT, top_k=top_k,
+        ).to_json(),
         "epsilon_mix": epsilon,
         "entropy_estimator": estimator,
     }
+    if agg is not None:
+        agg["top_k"] = np.asarray(top_k)
+        agg["n_experts"] = np.asarray(n_experts)
+        agg["epsilon"] = np.asarray(epsilon)
+        out["doc_aggregates"] = agg
     if buckets is not None:
         out["strata"] = {
             str(label): {

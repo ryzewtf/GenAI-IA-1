@@ -32,6 +32,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from ..metrics.bootstrap import save_aggregates
 from ..runtime.session import SessionBudget
 from ..traces.reader import TraceReader
 from .base import UndefinedFeature
@@ -141,8 +142,17 @@ def sweep(
     estimator: str = "miller_madow",
     probe_kwargs: Mapping[str, Any] | None = None,
     doc_strata: Mapping[str, Mapping[int, str]] | None = None,
+    agg_dir: Path | str | None = None,
+    f6_refit_lr: float | None = 3e-3,
 ) -> SweepResult:
-    """Fit and evaluate every (layer, feature) not already on disk."""
+    """Fit and evaluate every (layer, feature) not already on disk.
+
+    ``agg_dir`` also writes per-document test aggregates to ``<agg_dir>/<model>__<feature>.npz``
+    for the document bootstrap (audit L7). ``f6_refit_lr`` applies the F6 divergence rule in code
+    (audit M10): F6 is a superset of F1, F2 and F3, so if its best val CE is worse than any of
+    theirs at the same layer the fit has diverged, and it is refit once at this learning rate. The
+    rule reads val only; the refit is recorded in ``fit.refit_note``.
+    """
     unknown = [f for f in features if f not in FEATURES]
     if unknown:
         raise ValueError(f"unknown feature(s) {unknown}; have {FEATURES}")
@@ -177,6 +187,17 @@ def sweep(
 
     train_ids = index.token_ids[index.rows("train")]
 
+    aggregates: dict[str, dict[str, Any]] = {}
+    if agg_dir is not None:
+        for feature in ordered:
+            apath = Path(agg_dir) / f"{_slug(model)}__{feature}.npz"
+            aggregates[feature] = {}
+            if apath.exists() and not force:
+                with np.load(apath) as z:
+                    for key in z.files:
+                        lay, name = key.split("/", 1)
+                        aggregates[feature].setdefault(lay, {})[name] = z[key]
+
     for layer in layer_list:
         pending = [f for f in ordered if str(layer) not in documents[f]["layers"]]
         if not pending:
@@ -204,7 +225,32 @@ def sweep(
                     f1=f1_cache,
                     probe_kwargs=probe_kwargs or {},
                     doc_strata=doc_strata,
+                    want_aggregates=agg_dir is not None,
                 )
+                if feature == "F6" and f6_refit_lr is not None:
+                    subset_ce = [
+                        (documents[f]["layers"].get(str(layer)) or {}).get("fit", {}) or {}
+                        for f in ("F1", "F2", "F3") if f in documents
+                    ]
+                    subset_ce = [c.get("best_val_ce_bits") for c in subset_ce]
+                    subset_ce = [float(c) for c in subset_ce if c is not None and c == c]
+                    f6_ce = (record.get("fit") or {}).get("best_val_ce_bits")
+                    if subset_ce and f6_ce is not None and float(f6_ce) > min(subset_ce):
+                        first = float(f6_ce)
+                        record, _ = _fit_one(
+                            reader=reader, index=index, feature=feature, layer=layer, seed=seed,
+                            estimator=estimator, train_ids=train_ids,
+                            n_frequency_buckets=n_frequency_buckets, f1=f1_cache,
+                            probe_kwargs={**(probe_kwargs or {}), "lr": f6_refit_lr},
+                            doc_strata=doc_strata, want_aggregates=agg_dir is not None,
+                        )
+                        record["fit"]["refit_note"] = (
+                            f"val-flagged divergence (best_val_ce {first:.4f} > min(F1,F2,F3) "
+                            f"{min(subset_ce):.4f}); refit lr={f6_refit_lr}"
+                        )
+                agg = record.pop("_doc_aggregates", None)
+                if agg is not None:
+                    aggregates[feature][str(layer)] = agg
             except UndefinedFeature as exc:
                 record = {
                     "layer": layer,
@@ -224,6 +270,8 @@ def sweep(
                 timespec="seconds"
             )
             _atomic_write_json(output_path(out_dir, model, feature), documents[feature])
+            if agg_dir is not None and aggregates.get(feature):
+                save_aggregates(Path(agg_dir) / f"{_slug(model)}__{feature}.npz", aggregates[feature])
             touched = True
 
         if touched:
@@ -245,6 +293,7 @@ def _fit_one(
     f1: CountTablePredictor | None,
     probe_kwargs: Mapping[str, Any],
     doc_strata: Mapping[str, Mapping[int, str]] | None = None,
+    want_aggregates: bool = False,
 ) -> tuple[dict[str, Any], CountTablePredictor | None]:
     """Fit one cell on train, early-stop on val, evaluate on test."""
     needs_f1 = feature == "F6"
@@ -309,7 +358,9 @@ def _fit_one(
         estimator=estimator,
         buckets=buckets,
         bucket_meta=bucket_meta,
+        doc_ids=index.doc_ids[test.row_index] if want_aggregates else None,
     )
+    doc_aggregates = metrics.pop("doc_aggregates", None)
 
     # Plan T9.4: per-document strata (domain, language) on the same fitted predictor and test rows.
     # Per-stratum CE / Family A only (see evaluate_on_test); stored apart from F1's frequency strata.
@@ -346,6 +397,9 @@ def _fit_one(
         },
         "meta": train.meta,
     }
+
+    if doc_aggregates is not None:
+        record["_doc_aggregates"] = doc_aggregates  # popped by sweep() and stored as .npz
 
     if feature == "F3":
         # Plan T7.4: report F3 next to the raw statistic it generalizes, on the same split.

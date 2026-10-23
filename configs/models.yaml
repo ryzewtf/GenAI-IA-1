@@ -131,7 +131,10 @@ models:
     hf_repo: allenai/OLMoE-1B-7B-0924
     revision: null
     checkpoint_status: base
-    # Pair A: 0125 is 0924 annealed for a further 100B tokens; config.json files are IDENTICAL.
+    # Pair A is an annealing-RECIPE pair, not "0924 + 100B tokens": per the OLMoE paper (App. I),
+    # 0125 uses the same first-stage mix and is annealed for 100B tokens on Dolmino from
+    # step1200000-tokens5033B, while 0924 decayed its LR over its own final 100B tokens; a shared
+    # checkpoint is not stated. The config.json files are NOT identical (rms_norm_eps and dtype differ).
     # The ONLY pair in the panel where F1 conditions on an identical variable (same tokenizer),
     # so it carries the tokenizer-controlled version of the token-ID claim (§1.5, T7.3).
     role: [pair_a]

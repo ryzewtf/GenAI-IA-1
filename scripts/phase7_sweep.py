@@ -47,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--doc-strata", default=None, metavar="CORPUS_JSONL",
                     help="also report test metrics per domain and per lang (T9.4), read from this "
                          "corpus file's doc_id/domain/lang fields")
+    ap.add_argument("--agg-dir", default=None,
+                    help="also write per-document test aggregates for the bootstrap (audit L7)")
     args = ap.parse_args(argv)
 
     doc_strata = None
@@ -93,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                     seed=args.seed,
                     probe_kwargs=pkw,
                     doc_strata=doc_strata,
+                    agg_dir=args.agg_dir,
                 )
         except Exception as exc:
             print(f"!! {model}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

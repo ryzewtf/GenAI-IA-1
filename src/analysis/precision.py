@@ -9,7 +9,7 @@ Task   Variable                             Acceptance                   Judged 
 T3.7   router placement (GPU vs CPU)        >= 99.9% set agreement       worst layer
 T3.8   batching (prefill vs decode)         >= 99.9% set agreement       worst layer
 T8.2   quantization (F16 vs Q8_0/Q4_K_M)    a measured bound, not a pass  mean, banded by T8.3
-T8.5   tensor split (0.5/0.5 vs 0.7/0.3)    >= 99.9% set agreement       worst layer
+T8.5   tensor split (device split)          >= 99.9% set agreement       worst layer
 ===== ==================================== ============================ =========================
 
 The three gates share :func:`check_equivalence`; T8.3 keeps its own banded reading because it is
@@ -120,7 +120,7 @@ EQUIVALENCE_TASKS: dict[str, dict[str, str]] = {
     },
     "T8.5": {
         "varies": "tensor_split",
-        "label": "device split (0.5/0.5 vs 0.7/0.3)",
+        "label": "device split",
         "on_fail": (
             "Pair T results are split-dependent: every Qwen3 and Gemma 4 number must be collected "
             "under one pinned split, and that fact stated prominently."
@@ -570,21 +570,27 @@ def check_equivalence(
                 f"actually collected with a different {field_name}."
             )
 
+    # Name the values actually compared, so a verdict can never quote a split nobody ran.
+    ref_value, cand_value = _variant_values(comparison, spec["varies"])
+    label = spec["label"]
+    if ref_value is not None or cand_value is not None:
+        label = f"{label} ({spec['varies']} {ref_value} vs {cand_value})"
+
     passed = worst.set_agreement >= floor
     if passed:
         verdict = (
-            f"PASS: {spec['label']} is invisible to the routing — worst layer {worst.layer} agrees "
+            f"PASS: {label} is invisible to the routing — worst layer {worst.layer} agrees "
             f"at {worst.set_agreement:.6f} >= {floor}. Report the measured figure in the methods "
             "section; it upgrades an assumption into a verified claim."
         )
     else:
         verdict = (
-            f"FAIL: {spec['label']} changes the routing — layer {worst.layer} agrees at only "
+            f"FAIL: {label} changes the routing — layer {worst.layer} agrees at only "
             f"{worst.set_agreement:.6f} < {floor}. {spec['on_fail']}"
         )
 
     return EquivalenceResult(
-        task=task, label=spec["label"], passed=passed,
+        task=task, label=label, passed=passed,
         mean_set_agreement=comparison.mean_set_agreement, worst_layer=worst.layer,
         worst_set_agreement=worst.set_agreement, floor=floor, verdict=verdict,
     )

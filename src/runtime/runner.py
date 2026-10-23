@@ -748,8 +748,20 @@ def _check_nodes_captured(
 
     ubatch = int(config.inference["ubatch_size"])
     n_ubatches = nodes // per_ubatch
-    lo = max(plan.n_docs, _ceil_div(n_tokens, ubatch))
-    hi = (n_tokens + plan.n_docs * (ubatch - 1)) // ubatch
+    # T3.8 legs change the batching, so the bracket follows the spans moe_trace actually decoded:
+    # ``full`` is one token per llama_decode (exactly n_tokens ubatches); ``tail`` is one prefix
+    # span per document, at most ceil(prefix/ubatch) ubatches, then one ubatch per remaining token.
+    mode = str(stats.get("decode_mode", "off"))
+    if mode == "full":
+        lo = hi = n_tokens
+    elif mode == "tail":
+        steps = int(stats.get("n_decode_steps", -1))
+        prefix = int(stats.get("decode_prefix", 0))
+        lo = steps
+        hi = steps + plan.n_docs * (_ceil_div(prefix, ubatch) - 1)
+    else:
+        lo = max(plan.n_docs, _ceil_div(n_tokens, ubatch))
+        hi = (n_tokens + plan.n_docs * (ubatch - 1)) // ubatch
     if not lo <= n_ubatches <= hi:
         problems.append(
             f"nodes_captured={nodes} implies {n_ubatches} ubatches, but {plan.n_docs} documents "

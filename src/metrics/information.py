@@ -16,6 +16,19 @@ structure is reported separately, via ``exact_match`` in Family A.
     CE_norm(F)  = CE(F) / log2(n_experts)
     I_hat(E; F) = H - CE(F)                        # LOWER bound on mutual information
     ratio       = I_hat(E; F) / H
+    ratio_attainable = I_hat(E; F) / (H - log2 k)  # PRIMARY, k-invariant (see below)
+
+The attainable ceiling (audit L1/L2)
+------------------------------------
+Every row's per-slot CE is at least ``log2 k``: ``-(1/k) sum_{e in S} log2 q(e)`` over a ``q`` that
+sums to 1 is minimised by ``q`` uniform on ``S``, at exactly ``log2 k``. So ``CE >= log2 k`` and
+``I_hat <= H - log2 k``, which caps ``ratio`` at ``(H - log2 k) / H`` (about 0.47-0.59 on this
+panel), not at 1. Roughly half of the slot-level entropy is the uniform choice of a slot *inside*
+the executed set, which no predictor can or needs to resolve. ``ratio`` read against 1 therefore
+overstates what is "left unexplained", and because the cap depends on ``k`` and ``H`` it differs
+between models (gpt-oss 0.556 vs OLMoE 0.474), biasing any cross-model comparison toward small k.
+``ratio_attainable`` divides by the attainable maximum instead: 0 = the marginal, 1 = a predictor
+that puts all its mass, uniformly, on the executed set. It is the primary Family B number.
 
 Two things this module refuses to do
 ------------------------------------
@@ -347,6 +360,7 @@ class MILowerBound:
     n_experts: int
     estimator: str = "miller_madow"
     split: str | None = None
+    top_k: int | None = None
 
     @property
     def mi_bits(self) -> float:
@@ -359,6 +373,21 @@ class MILowerBound:
         if self.entropy_bits == 0.0:
             return float("nan")
         return self.mi_bits / self.entropy_bits
+
+    @property
+    def attainable_bits(self) -> float:
+        """``H - log2 k``: the largest ``I_hat`` any predictor can reach (module docstring)."""
+        if self.top_k is None:
+            return float("nan")
+        return self.entropy_bits - math.log2(self.top_k)
+
+    @property
+    def ratio_attainable(self) -> float:
+        """``I_hat / (H - log2 k)``. Signed; NaN without ``top_k`` or when the ceiling is <= 0."""
+        ceiling = self.attainable_bits
+        if not ceiling > 0.0:
+            return float("nan")
+        return self.mi_bits / ceiling
 
     @property
     def ce_normalized(self) -> float:
@@ -384,6 +413,9 @@ class MILowerBound:
             "cross_entropy_bits": self.cross_entropy_bits,
             "mi_bits": self.mi_bits,
             "ratio": self.ratio,
+            "top_k": self.top_k,
+            "attainable_bits": self.attainable_bits,
+            "ratio_attainable": self.ratio_attainable,
             "ce_normalized": self.ce_normalized,
             "entropy_normalized": self.entropy_normalized,
             "negative": self.negative,
@@ -401,6 +433,7 @@ def mi_lower_bound(
     estimator: str = "miller_madow",
     entropy_split: str | None = None,
     ce_split: str | None = None,
+    top_k: int | None = None,
 ) -> MILowerBound:
     """Difference ``H - CE`` without clamping, refusing to mix splits.
 
@@ -420,6 +453,7 @@ def mi_lower_bound(
         n_experts=int(n_experts),
         estimator=estimator,
         split=entropy_split or ce_split,
+        top_k=None if top_k is None else int(top_k),
     )
 
 

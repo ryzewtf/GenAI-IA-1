@@ -11,6 +11,10 @@ the *source* layer; only the label layer is shifted. Pure CPU on existing traces
 Targets: every model, ℓ at normalized depths {0.3, 0.5, 0.7, 0.9} (ℓ−j < 0 is skipped).
 
 Usage: python -m scripts.phase10_lookahead [--models a,b] [--root E:/temp/traces]
+       [--probe-kwargs '{"lbfgs_maxiter": 2000, "l2": 0.001}'] [--out ...]
+
+The v0.1 run used the F4 defaults (150 L-BFGS iterations), which the convergence study (audit L6)
+showed stop short of the optimum; pass the converged settings and a new --out to refit.
 """
 from __future__ import annotations
 
@@ -35,7 +39,9 @@ def main(argv=None) -> int:
     ap.add_argument("--models", default=",".join(ENGINE_BY_MODEL))
     ap.add_argument("--out", default="results/phase10/lookahead.json")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--probe-kwargs", default=None, help="JSON of probe fields, as in phase7_sweep")
     args = ap.parse_args(argv)
+    pkw = json.loads(args.probe_kwargs) if args.probe_kwargs else {}
 
     splits = {int(k): v for k, v in json.loads(Path(args.splits).read_text("utf-8")).items()}
     out_path = Path(args.out)
@@ -59,10 +65,17 @@ def main(argv=None) -> int:
                     ys = [labels[x.row_index].astype("int32") for x in (tr, va, te)]
                     p = _make_predictor("F4", n_experts=r.n_experts, vocab_size=index.vocab_size,
                                         layer=target, seed=args.seed)
+                    for name, value in pkw.items():
+                        if not hasattr(p, name):
+                            raise ValueError(f"probe_kwargs[{name!r}] is not a field of {type(p).__name__}")
+                        setattr(p, name, value)
                     p.fit(tr.X, ys[0], va.X, ys[1])
                     m = evaluate_on_test(p, te.X, ys[2], n_experts=r.n_experts, top_k=r.top_k)
                     mres[key] = {"target_layer": target, "source_layer": src, "lag": j,
                                  "depth": f, "mi_ratio": m["family_b"]["ratio"],
+                                 "mi_attainable": m["family_b"]["ratio_attainable"],
+                                 "converged": p.report.hyperparams.get("converged"),
+                                 "n_iter": p.report.hyperparams.get("n_iter"),
                                  "set_agreement@k": m["family_a"]["set_agreement@k"],
                                  "recall@k": m["family_a"][f"recall@{r.top_k}"],
                                  "n_test_rows": m["n_rows"]}
